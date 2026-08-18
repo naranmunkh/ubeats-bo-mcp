@@ -1,0 +1,26 @@
+{
+  "name": "ubeats-bo-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for the UBEats Backoffice API (office.ubeats.mn / ubeats-bo-api.ubcabtech.com). Keycloak SSO auth; reports, orders, catalog.",
+  "type": "module",
+  "scripts": {
+    "compile": "tsc",
+    "start": "node dist/api/index.js",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test:login": "node --env-file=.env scripts/test-login.mjs",
+    "test:report": "node --env-file=.env scripts/test-login.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@vercel/node": "^3.2.0",
+    "typescript": "^5.5.0"
+  }
+}
