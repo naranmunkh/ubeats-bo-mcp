@@ -22,9 +22,16 @@
  *   Every API call sends Origin/Referer = https://office.ubeats.mn so the BO's
  *   allowed-origins check passes.
  *
+ * ⚠ OTP (2026-10): the ubcab-bo realm now requires an authenticator-app OTP.
+ *   Password grant without a code is rejected, and a server can't supply a
+ *   30-second code. So production auth = an OFFLINE refresh token obtained once
+ *   with `npm run login` (password + OTP, scope offline_access). Offline tokens
+ *   survive SSO logout and live until unused for the realm's Offline Session
+ *   Idle (Keycloak default 30 days) — each MCP call refreshes it.
+ *
  * Env:
- *   UBEATS_BO_USERNAME, UBEATS_BO_PASSWORD   password-grant creds (recommended)
- *   UBEATS_BO_REFRESH_TOKEN                  alternative to username/password
+ *   UBEATS_BO_REFRESH_TOKEN                  offline token from `npm run login` (REQUIRED with OTP)
+ *   UBEATS_BO_USERNAME, UBEATS_BO_PASSWORD   password grant — only for accounts WITHOUT OTP
  *   UBEATS_BO_CLIENT_ID                      OIDC client (default ubeats-bo)
  *   UBEATS_BO_SSO_URL                        Keycloak base (default https://sso.ubcabtech.com)
  *   UBEATS_BO_REALM                          realm (default ubcab-bo)
@@ -124,7 +131,9 @@ class UBEatsBOClient {
 
   private async authenticate(): Promise<string> {
     const hasPassword = !!(this.cfg.username && this.cfg.password);
-    // Prefer refresh_token (cheaper, avoids re-sending creds); fall back to password.
+    let refreshErr: unknown = null;
+    // 1) Offline/refresh token — the ONLY path that works once Keycloak OTP is on.
+    //    Get one with `npm run login` (password + 6-digit authenticator code).
     if (this.refreshToken) {
       try {
         return await this.tokenRequest({
@@ -133,21 +142,29 @@ class UBEatsBOClient {
           client_id: this.clientId,
         });
       } catch (err) {
-        if (!hasPassword) throw err; // nothing else to try
-        // refresh expired/rotated — fall through to password grant
+        refreshErr = err;
+        if (!hasPassword) throw otpHelp(err, "refresh");
+        // fall through to password grant (works only for accounts without OTP)
       }
     }
+    // 2) Password grant — legacy; Keycloak rejects it with
+    //    invalid_grant "Invalid user credentials" when the user has OTP configured.
     if (hasPassword) {
-      return this.tokenRequest({
-        grant_type: "password",
-        client_id: this.clientId,
-        username: this.cfg.username,
-        password: this.cfg.password,
-        scope: "openid",
-      });
+      try {
+        return await this.tokenRequest({
+          grant_type: "password",
+          client_id: this.clientId,
+          username: this.cfg.username,
+          password: this.cfg.password,
+          scope: "openid",
+        });
+      } catch (err) {
+        throw otpHelp(err, refreshErr ? "both" : "password");
+      }
     }
     throw new BOError(
-      "No credentials. Set UBEATS_BO_USERNAME + UBEATS_BO_PASSWORD, or UBEATS_BO_REFRESH_TOKEN."
+      "No credentials. Set UBEATS_BO_REFRESH_TOKEN (run `npm run login` locally — OTP required), " +
+        "or UBEATS_BO_USERNAME + UBEATS_BO_PASSWORD for an account without OTP."
     );
   }
 
@@ -221,6 +238,27 @@ class UBEatsBOClient {
     }
     return { status: res.status, ok: true, body };
   }
+}
+
+/**
+ * Wrap a Keycloak auth failure with an actionable hint. Since the ubcab-bo realm
+ * turned on authenticator-app OTP, password grant without a code fails with the
+ * deliberately vague `invalid_grant: Invalid user credentials`, and an expired
+ * offline token fails with `invalid_grant: Offline session not active` / similar.
+ */
+function otpHelp(err: unknown, stage: "refresh" | "password" | "both"): BOError {
+  const base = err instanceof BOError ? err : new BOError(String(err));
+  const hint =
+    stage === "password"
+      ? "Нууц үгээр нэвтрэх боломжгүй — BO данс OTP (authenticator app) шаарддаг болсон. "
+      : "Offline/refresh token хүчингүй болсон (30 хоног ашиглагдаагүй, эсвэл logout/нууц үг солигдсон). ";
+  return new BOError(
+    `${base.message}. ${hint}` +
+      "Засах: Mac дээр ubeats-bo-mcp хавтсанд `npm run login` ажиллуулж (нууц үг + 6 оронтой OTP), " +
+      "гарсан UBEATS_BO_REFRESH_TOKEN-ийг Vercel env-д хийгээд Redeploy хийнэ.",
+    base.status,
+    base.body
+  );
 }
 
 async function safeJson(res: Response): Promise<unknown> {

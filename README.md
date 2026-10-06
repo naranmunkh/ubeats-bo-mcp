@@ -6,9 +6,40 @@ MCP server for the **UBEats Backoffice** (`office.ubeats.mn`, API host
 (local / Claude Desktop) or as a bearer-guarded Streamable HTTP endpoint on
 Vercel.
 
-## Auth
+## Auth — OTP (authenticator app) since 2026-10
 
-Keycloak SSO — verified 2026-08-18 against a live BO session:
+The `ubcab-bo` realm now requires a 6-digit authenticator-app code at login.
+A server can't produce a 30-second code, so **password grant no longer works**
+(Keycloak answers `invalid_grant: Invalid user credentials`).
+
+Production auth is an **offline refresh token** you mint once on your Mac:
+
+```bash
+npm run login
+```
+
+It asks for the 6-digit code (password is read from `.env` if present,
+otherwise prompted without echo), requests `scope=openid offline_access`,
+proves the token by refreshing it and calling the API, then writes
+`UBEATS_BO_REFRESH_TOKEN` into `.env` and copies it to the clipboard. The token
+is never printed.
+
+Then in Vercel → `ubeats-bo-mcp` → Settings → Environment Variables:
+set `UBEATS_BO_REFRESH_TOKEN` (Production + Preview), delete
+`UBEATS_BO_PASSWORD`, and **Redeploy** (env changes need a new deployment).
+
+The offline token lives until it goes unused for the realm's *Offline Session
+Idle* (Keycloak default 30 days); every MCP call extends it. It is revoked by a
+password change or an admin "sign out all sessions". When it dies the tools
+return an error that says exactly this — rerun `npm run login`.
+
+`npm run login:bo` does the same for the UBCab BO (`bo-mcp`, client
+`ubcab-registration-bo`) and writes `UBCAB_BO_REFRESH_TOKEN` — paste that into
+the **bo-mcp** Vercel project instead.
+
+### Keycloak details
+
+Verified 2026-08-18 against a live BO session:
 
 | | |
 |---|---|
@@ -82,8 +113,9 @@ headers handled. Use it to probe undocumented endpoints before adding a real too
 ```bash
 npm install
 npm run typecheck
-cp .env.example .env      # fill in creds
-npm run test:login        # live smoke test: auth + one driver-revenue page
+cp .env.example .env
+npm run login
+npm run test:login
 npm run compile && npm start   # stdio MCP server
 ```
 
@@ -101,7 +133,7 @@ to it. Three rules carried over from `ubcab-bo-mcp` (learned the hard way):
 
 Deploy by pushing to `main` (git integration), not from the CLI.
 
-Env vars to set in Vercel: `UBEATS_BO_USERNAME`, `UBEATS_BO_PASSWORD`,
+Env vars to set in Vercel: `UBEATS_BO_REFRESH_TOKEN` (from `npm run login`),
 `UBEATS_BO_MCP_AUTH_TOKEN` (`openssl rand -hex 32`).
 
 Health check: `GET /health` → `{"status":"ok","server":"ubeats-bo-mcp"}`

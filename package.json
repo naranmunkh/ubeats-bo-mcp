@@ -9,7 +9,9 @@
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
     "test:login": "node --env-file=.env scripts/test-login.mjs",
-    "test:report": "node --env-file=.env scripts/test-login.mjs"
+    "test:report": "node --env-file=.env scripts/test-login.mjs",
+    "login": "node scripts/login-otp.mjs --preset ubeats",
+    "login:bo": "node scripts/login-otp.mjs --preset bo"
   },
   "engines": {
     "node": ">=18"
