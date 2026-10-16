@@ -140,6 +140,14 @@ class BOError extends Error {
   }
 }
 
+/**
+ * Auth-code revision, printed in every Keycloak auth error together with the
+ * (non-secret) login settings. One failing tool call then shows which build is
+ * live and what it sent — a stale deploy and a wrong env var look identical
+ * otherwise. Bump it with every auth change.
+ */
+const AUTH_BUILD = "2026-10-16 bo-login+totp";
+
 interface RequestOptions {
   query?: Record<string, unknown>;
   body?: unknown;
@@ -152,6 +160,8 @@ interface AuthConfig {
   password: string;
   /** base32 TOTP secret; when set, every password grant carries a fresh `totp` code. */
   totpSecret?: string;
+  /** Which env vars the login came from (e.g. "UBCAB_BO_*"), for error messages. Never a value. */
+  loginSource?: string;
   refreshToken: string;
   clientId: string;
   ssoUrl: string;
@@ -236,7 +246,7 @@ class UBEatsBOClient {
         const period = totpPeriodMs();
         const waitMs = period - (Date.now() % period) + 1_000;
         await new Promise((resolve) => setTimeout(resolve, waitMs));
-        return this.tokenRequest({ ...params, totp: totpFromEnv(this.cfg.totpSecret) as string });
+        return this.tokenRequest({ ...params, totp: totpFromEnv(this.cfg.totpSecret) as string }, "retried with the next 30 s code");
       }
     }
     throw new BOError(
@@ -244,7 +254,17 @@ class UBEatsBOClient {
     );
   }
 
-  private async tokenRequest(params: Record<string, string>): Promise<string> {
+  /** Non-secret description of a token request: build, client, origin, login source, OTP. */
+  private authContext(params: Record<string, string>, note?: string): string {
+    const parts = [`build ${AUTH_BUILD}`, `client=${this.clientId}`, `origin=${this.origin}`, `grant=${params.grant_type}`];
+    if (params.grant_type === "password") {
+      parts.push(`login=${this.cfg.loginSource ?? "custom"}`, `totp=${params.totp ? "sent" : "not configured"}`);
+    }
+    if (note) parts.push(note);
+    return parts.join(", ");
+  }
+
+  private async tokenRequest(params: Record<string, string>, note?: string): Promise<string> {
     const res = await fetch(this.tokenUrl, {
       method: "POST",
       headers: {
@@ -257,7 +277,11 @@ class UBEatsBOClient {
     });
     const body = await safeJson(res);
     if (!res.ok) {
-      throw new BOError(`Keycloak auth failed (HTTP ${res.status})`, res.status, body);
+      throw new BOError(
+        `Keycloak auth failed (HTTP ${res.status}) [${this.authContext(params, note)}]`,
+        res.status,
+        body
+      );
     }
     const obj = (body ?? {}) as Record<string, any>;
     const token = obj.access_token;
@@ -369,19 +393,21 @@ async function guarded(fn: () => Promise<BOResult>): Promise<ToolResult> {
  * come from one source, never mixed. The UBEATS_BO_* / UBEATS_* login is only a
  * fallback for deployments that have no BO login set.
  */
-function loginFromEnv(): Pick<AuthConfig, "username" | "password" | "totpSecret"> {
+function loginFromEnv(): Pick<AuthConfig, "username" | "password" | "totpSecret" | "loginSource"> {
   const env = process.env;
   if (env.UBCAB_BO_USERNAME && env.UBCAB_BO_PASSWORD) {
     return {
       username: env.UBCAB_BO_USERNAME,
       password: env.UBCAB_BO_PASSWORD,
       totpSecret: env.UBCAB_BO_TOTP_SECRET ?? "",
+      loginSource: "UBCAB_BO_*",
     };
   }
   return {
     username: env.UBEATS_BO_USERNAME ?? env.UBEATS_USERNAME ?? "",
     password: env.UBEATS_BO_PASSWORD ?? env.UBEATS_PASSWORD ?? "",
     totpSecret: env.UBEATS_BO_TOTP_SECRET ?? env.UBEATS_TOTP_SECRET ?? "",
+    loginSource: "UBEATS_BO_* (fallback: UBCAB_BO_USERNAME/PASSWORD not set)",
   };
 }
 
