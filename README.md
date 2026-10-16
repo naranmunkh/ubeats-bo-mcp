@@ -118,7 +118,7 @@ to it. Three rules carried over from `ubcab-bo-mcp` (learned the hard way):
 3. **No imports from `src/`** — esbuild's Node16 resolver won't map `.js` → `.ts`
    and you get a 500. Everything lives in the one file.
 
-Deploy by pushing to `main` (git integration), not from the CLI.
+Deploy by pushing to `master` (git integration), not from the CLI.
 
 Env vars to set in Vercel: `UBCAB_BO_USERNAME`, `UBCAB_BO_PASSWORD`,
 `UBCAB_BO_TOTP_SECRET` (copy all three from the bo-mcp project), and
@@ -126,6 +126,19 @@ Env vars to set in Vercel: `UBCAB_BO_USERNAME`, `UBCAB_BO_PASSWORD`,
 `UBEATS_BO_PASSWORD` can stay; the BO login takes precedence once set.
 
 Health check: `GET /health` → `{"status":"ok","server":"ubeats-bo-mcp"}`
+
+### Is the latest build live?
+
+Every Keycloak auth error ends with a non-secret context, for example
+`[build 2026-10-16 bo-login+totp, client=ubeats-bo, origin=https://office.ubeats.mn, grant=password, login=UBCAB_BO_*, totp=sent]`.
+
+- No `[build …]` at all → an old deploy is still serving. Check Vercel →
+  Deployments: the top Production deployment must be the latest `master` commit
+  ("Redeploy" on an old deployment rebuilds that old source).
+- `login=UBEATS_BO_* (fallback…)` → `UBCAB_BO_USERNAME` / `UBCAB_BO_PASSWORD` are not
+  set on that deployment (env changes need a new deploy).
+- `totp=not configured` → `UBCAB_BO_TOTP_SECRET` is missing.
+- `totp=sent` with `invalid_grant` → wrong password or TOTP secret.
 
 ## Known gaps
 
