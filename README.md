@@ -20,6 +20,24 @@ Keycloak SSO — verified 2026-08-18 against a live BO session:
 Access tokens live ~5 minutes; the server caches until ~30s before expiry and
 re-auths silently (refresh_token first, then password grant).
 
+**Login = the BO login.** The UBEats BO is just another client of the
+`ubcab-bo` realm, so the server logs in with the same BO account as
+`ubcab-bo-mcp`, under the same env names:
+
+- `UBCAB_BO_USERNAME` + `UBCAB_BO_PASSWORD` — the BO account.
+- `UBCAB_BO_TOTP_SECRET` — **required since 2026-10-05**, when Keycloak started
+  enforcing OTP on the realm. It is the account's base32 TOTP secret (the text
+  under «Unable to scan?» in the authenticator setup). Every password grant sends
+  a freshly generated 6-digit `totp`. Without it Keycloak answers `invalid_grant`
+  «Invalid user credentials».
+- A TOTP code is single-use, and the account is shared with `ubcab-bo-mcp` and
+  the browser. If another login spent the current code, the server waits for the
+  next 30 s step and retries once, so a cold login can take ~35 s.
+- `UBEATS_BO_USERNAME` / `_PASSWORD` / `_TOTP_SECRET` are only a fallback, used
+  when no BO login is set.
+
+Check the generator offline with `npm run test:totp` (RFC 6238 vectors).
+
 ## Tools (21)
 
 ### Reports (8)
@@ -82,7 +100,8 @@ headers handled. Use it to probe undocumented endpoints before adding a real too
 ```bash
 npm install
 npm run typecheck
-cp .env.example .env      # fill in creds
+cp .env.example .env      # fill in the BO login (UBCAB_BO_*, incl. TOTP secret)
+npm run test:totp         # offline TOTP generator check
 npm run test:login        # live smoke test: auth + one driver-revenue page
 npm run compile && npm start   # stdio MCP server
 ```
@@ -101,8 +120,10 @@ to it. Three rules carried over from `ubcab-bo-mcp` (learned the hard way):
 
 Deploy by pushing to `main` (git integration), not from the CLI.
 
-Env vars to set in Vercel: `UBEATS_BO_USERNAME`, `UBEATS_BO_PASSWORD`,
-`UBEATS_BO_MCP_AUTH_TOKEN` (`openssl rand -hex 32`).
+Env vars to set in Vercel: `UBCAB_BO_USERNAME`, `UBCAB_BO_PASSWORD`,
+`UBCAB_BO_TOTP_SECRET` (copy all three from the bo-mcp project), and
+`UBEATS_BO_MCP_AUTH_TOKEN` (`openssl rand -hex 32`). Old `UBEATS_BO_USERNAME` /
+`UBEATS_BO_PASSWORD` can stay; the BO login takes precedence once set.
 
 Health check: `GET /health` → `{"status":"ok","server":"ubeats-bo-mcp"}`
 

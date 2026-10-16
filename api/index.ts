@@ -23,17 +23,21 @@
  *   allowed-origins check passes.
  *
  * Env:
- *   UBEATS_BO_USERNAME, UBEATS_BO_PASSWORD   password-grant creds (recommended)
- *   UBEATS_BO_REFRESH_TOKEN                  alternative to username/password
+ *   UBCAB_BO_USERNAME, UBCAB_BO_PASSWORD     the BO login (same account and env names as
+ *                                            ubcab-bo-mcp). Used whenever both are set.
+ *   UBCAB_BO_TOTP_SECRET                     base32 TOTP secret of that account. Keycloak
+ *                                            enforces 2FA on the realm (2026-10-05); a fresh
+ *                                            code is generated for every password grant.
+ *   UBCAB_BO_TOTP_DIGITS / _PERIOD / _ALGORITHM  defaults 6 / 30 / SHA1 (Keycloak defaults)
+ *   UBEATS_BO_USERNAME, UBEATS_BO_PASSWORD,  fallback login, only when the BO login is unset
+ *   UBEATS_BO_TOTP_SECRET                    (UBEATS_USERNAME / _PASSWORD / _TOTP_SECRET too)
+ *   UBEATS_BO_REFRESH_TOKEN                  optional; must be a ubeats-bo client token
  *   UBEATS_BO_CLIENT_ID                      OIDC client (default ubeats-bo)
  *   UBEATS_BO_SSO_URL                        Keycloak base (default https://sso.ubcabtech.com)
  *   UBEATS_BO_REALM                          realm (default ubcab-bo)
  *   UBEATS_BO_API_URL                        API base (default https://ubeats-bo-api.ubcabtech.com)
  *   UBEATS_BO_ORIGIN                         Origin/Referer (default https://office.ubeats.mn)
  *   UBEATS_BO_MCP_AUTH_TOKEN                 required in HTTP mode (fails closed)
- *
- * UBEATS_USERNAME / UBEATS_PASSWORD are accepted as fallbacks so this server can
- * share the env already set up for ubcab-bo-mcp.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -43,6 +47,72 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+
+// ===========================================================================
+// TOTP (RFC 6238) — Keycloak 2FA on the BO realm (2026-10-05)
+// Same generator as ubcab-bo-mcp (verified against the RFC 6238 vectors:
+// scripts/test-totp.mjs).
+// ===========================================================================
+
+/** Decode an RFC 4648 base32 secret (spaces, dashes, padding and case ignored). */
+export function base32Decode(input: string): Buffer {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const clean = input.toUpperCase().replace(/[\s=-]/g, "");
+  if (!clean) throw new Error("Empty TOTP secret");
+  let bits = 0;
+  let value = 0;
+  const out: number[] = [];
+  for (const ch of clean) {
+    const idx = alphabet.indexOf(ch);
+    if (idx < 0) throw new Error("TOTP secret is not valid base32");
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(out);
+}
+
+/** RFC 6238 TOTP code. `secret` may be a base32 string or raw key bytes. */
+export function totpCode(
+  secret: string | Buffer,
+  opts: { now?: number; period?: number; digits?: number; algorithm?: string } = {},
+): string {
+  const key = typeof secret === "string" ? base32Decode(secret) : secret;
+  const period = opts.period ?? 30;
+  const digits = opts.digits ?? 6;
+  const algorithm = (opts.algorithm ?? "SHA1").toLowerCase().replace("-", "");
+  const counter = Math.floor((opts.now ?? Date.now()) / 1000 / period);
+  const msg = Buffer.alloc(8);
+  msg.writeUInt32BE(Math.floor(counter / 0x100000000), 0);
+  msg.writeUInt32BE(counter >>> 0, 4);
+  const h = createHmac(algorithm, key).update(msg).digest();
+  const offset = h[h.length - 1] & 0x0f;
+  const bin = ((h[offset] & 0x7f) << 24) | (h[offset + 1] << 16) | (h[offset + 2] << 8) | h[offset + 3];
+  return String(bin % 10 ** digits).padStart(digits, "0");
+}
+
+function totpPeriodMs(): number {
+  return (Number(process.env.UBCAB_BO_TOTP_PERIOD) || 30) * 1000;
+}
+
+/** Current TOTP code for `secret` with the realm's OTP policy (env-overridable). */
+function totpFromEnv(secret: string | undefined): string | undefined {
+  if (!secret) return undefined;
+  return totpCode(secret, {
+    digits: Number(process.env.UBCAB_BO_TOTP_DIGITS) || 6,
+    period: totpPeriodMs() / 1000,
+    algorithm: process.env.UBCAB_BO_TOTP_ALGORITHM || "SHA1",
+  });
+}
+
+function isInvalidGrant(err: unknown): boolean {
+  if (!(err instanceof BOError) || (err.status !== 400 && err.status !== 401)) return false;
+  const body = (err.body ?? {}) as Record<string, unknown>;
+  return body.error === "invalid_grant";
+}
 
 // ===========================================================================
 // UBEats BO API client (Keycloak auth)
@@ -80,6 +150,8 @@ interface RequestOptions {
 interface AuthConfig {
   username: string;
   password: string;
+  /** base32 TOTP secret; when set, every password grant carries a fresh `totp` code. */
+  totpSecret?: string;
   refreshToken: string;
   clientId: string;
   ssoUrl: string;
@@ -138,16 +210,37 @@ class UBEatsBOClient {
       }
     }
     if (hasPassword) {
-      return this.tokenRequest({
+      const params: Record<string, string> = {
         grant_type: "password",
         client_id: this.clientId,
         username: this.cfg.username,
         password: this.cfg.password,
         scope: "openid",
-      });
+      };
+      // Keycloak enforces 2FA on the BO realm: without a code the password grant
+      // fails with invalid_grant «Invalid user credentials». The code is generated
+      // here, never logged.
+      const totp = totpFromEnv(this.cfg.totpSecret);
+      if (!totp) return this.tokenRequest(params);
+      try {
+        return await this.tokenRequest({ ...params, totp });
+      } catch (err) {
+        // A TOTP code is single-use in Keycloak, and the BO login is shared with
+        // ubcab-bo-mcp (and the owner's browser). When another login spends the
+        // current step's code first, ours gets invalid_grant. The realm does not
+        // accept the next step's code early (learned in ubcab-bo-mcp 2026-10-06), so
+        // wait for the next step to begin and log in with that fresh code. ONE retry
+        // only, so a wrong password/secret cannot trip Keycloak's brute-force lockout.
+        // A login can therefore take ~35 s.
+        if (!isInvalidGrant(err)) throw err;
+        const period = totpPeriodMs();
+        const waitMs = period - (Date.now() % period) + 1_000;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        return this.tokenRequest({ ...params, totp: totpFromEnv(this.cfg.totpSecret) as string });
+      }
     }
     throw new BOError(
-      "No credentials. Set UBEATS_BO_USERNAME + UBEATS_BO_PASSWORD, or UBEATS_BO_REFRESH_TOKEN."
+      "No credentials. Set the BO login: UBCAB_BO_USERNAME + UBCAB_BO_PASSWORD + UBCAB_BO_TOTP_SECRET."
     );
   }
 
@@ -269,12 +362,36 @@ async function guarded(fn: () => Promise<BOResult>): Promise<ToolResult> {
 // UBEats BO client factory
 // ===========================================================================
 
+/**
+ * The UBEats BO is just another client ("ubeats-bo") of the same Keycloak realm as
+ * the UBCab BO, so this server logs in with the BO login — the same account, TOTP
+ * secret and env names as ubcab-bo-mcp. Username, password and TOTP secret always
+ * come from one source, never mixed. The UBEATS_BO_* / UBEATS_* login is only a
+ * fallback for deployments that have no BO login set.
+ */
+function loginFromEnv(): Pick<AuthConfig, "username" | "password" | "totpSecret"> {
+  const env = process.env;
+  if (env.UBCAB_BO_USERNAME && env.UBCAB_BO_PASSWORD) {
+    return {
+      username: env.UBCAB_BO_USERNAME,
+      password: env.UBCAB_BO_PASSWORD,
+      totpSecret: env.UBCAB_BO_TOTP_SECRET ?? "",
+    };
+  }
+  return {
+    username: env.UBEATS_BO_USERNAME ?? env.UBEATS_USERNAME ?? "",
+    password: env.UBEATS_BO_PASSWORD ?? env.UBEATS_PASSWORD ?? "",
+    totpSecret: env.UBEATS_BO_TOTP_SECRET ?? env.UBEATS_TOTP_SECRET ?? "",
+  };
+}
+
 let cachedClient: UBEatsBOClient | null = null;
 function getClient(): UBEatsBOClient {
   if (!cachedClient) {
     cachedClient = new UBEatsBOClient({
-      username: process.env.UBEATS_BO_USERNAME ?? process.env.UBEATS_USERNAME ?? "",
-      password: process.env.UBEATS_BO_PASSWORD ?? process.env.UBEATS_PASSWORD ?? "",
+      ...loginFromEnv(),
+      // Not UBCAB_BO_REFRESH_TOKEN: a refresh token is bound to the client that
+      // issued it, and the BO's is "ubcab-registration-bo", not "ubeats-bo".
       refreshToken: process.env.UBEATS_BO_REFRESH_TOKEN ?? process.env.UBEATS_REFRESH_TOKEN ?? "",
       clientId: process.env.UBEATS_BO_CLIENT_ID ?? process.env.UBEATS_CLIENT_ID ?? DEFAULT_CLIENT_ID,
       ssoUrl: process.env.UBEATS_BO_SSO_URL ?? DEFAULT_SSO_URL,
