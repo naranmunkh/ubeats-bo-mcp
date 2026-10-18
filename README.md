@@ -30,10 +30,17 @@ same question can get different answers, exactly as in office.ubeats.mn.
   unused; ended by a password change or "sign out all sessions"). When it ends,
   `/mcp` answers 401 and the tools say: *Settings → Connectors → UBEats BO →
   Disconnect → Connect*.
-- **OTP**: office.ubeats.mn's own login doesn't ask for OTP, but Keycloak's
-  direct-grant flow does for users who have an authenticator set up (e.g. for
-  the UBCab BO). Leave the field empty first; if the login fails the page asks
-  for the code.
+- **Same login path as office.ubeats.mn (no OTP)**: the server drives Keycloak's
+  *browser* flow for the `ubeats-bo` client — GET the login page, POST the
+  user's email + password to Keycloak's own form (with its cookies), capture
+  the `302 https://office.ubeats.mn/?code=…`, and exchange the code with PKCE.
+  That flow doesn't ask for OTP, exactly like office.ubeats.mn. (The realm's
+  *direct grant* does ask OTP from anyone with an authenticator configured —
+  e.g. for the UBCab BO — which is why a plain password grant failed.)
+  The OTP field appears only if Keycloak's page actually asks for a code.
+  If the browser flow can't be driven (theme change, redirect URI rejected…),
+  the server falls back to the direct grant and the error shows
+  `[тех.: <build>; browser flow: <reason>]`.
 
 Vercel env for this mode:
 
@@ -169,7 +176,7 @@ Deploy by pushing to `master` (git integration), not from the CLI.
 Env vars to set in Vercel: `UBEATS_BO_MCP_AUTH_TOKEN` and
 `UBEATS_BO_ALLOWED_EMAILS` (see the Auth section).
 
-Health check: `GET /health` → `{"status":"ok","server":"ubeats-bo-mcp","build":"2026-10-18 per-user-login+bo-totp",…}`
+Health check: `GET /health` → `{"status":"ok","server":"ubeats-bo-mcp","build":"2026-10-18b per-user-browser-login",…}`
 plus `allowlistConfigured`, `signingSecretConfigured`, `serviceAccountConfigured`.
 
 ### Is the latest build live?
@@ -179,7 +186,7 @@ plus `allowlistConfigured`, `signingSecretConfigured`, `serviceAccountConfigured
   the latest `master` commit ("Redeploy" on an old deployment rebuilds that old
   source).
 - Every Keycloak auth error ends with a non-secret context, e.g.
-  `[build 2026-10-18 per-user-login+bo-totp, client=ubeats-bo, origin=https://office.ubeats.mn, grant=password, login=UBCAB_BO_*, totp=sent]`.
+  `[build 2026-10-18b per-user-browser-login, client=ubeats-bo, origin=https://office.ubeats.mn, grant=password, login=UBCAB_BO_*, totp=sent]`.
   `login=UBEATS_BO_* (fallback…)` → `UBCAB_BO_*` not set on that deployment (env
   changes need a new deploy); `totp=not configured` → `UBCAB_BO_TOTP_SECRET`
   missing; `totp=sent` with `invalid_grant` → wrong password or TOTP secret.

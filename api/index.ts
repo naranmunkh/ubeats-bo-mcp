@@ -149,7 +149,7 @@ class BOError extends Error {
  * live and what it sent — a stale deploy and a wrong env var look identical
  * otherwise. Bump it with every auth change.
  */
-const AUTH_BUILD = "2026-10-18 per-user-login+bo-totp";
+const AUTH_BUILD = "2026-10-18b per-user-browser-login";
 
 interface RequestOptions {
   query?: Record<string, unknown>;
@@ -540,7 +540,7 @@ interface UserLogin {
  * browser login doesn't. Asks for offline_access so the connection survives
  * SSO logout and lasts until unused for Offline Session Idle (default 30 days).
  */
-async function keycloakUserLogin(username: string, password: string, otp: string): Promise<UserLogin> {
+async function keycloakDirectGrantLogin(username: string, password: string, otp: string): Promise<UserLogin> {
   const kc = kcConfig();
   const tokenUrl = `${kc.ssoUrl}/realms/${encodeURIComponent(kc.realm)}/protocol/openid-connect/token`;
   const post = async (scope: string) => {
@@ -592,6 +592,299 @@ async function keycloakUserLogin(username: string, password: string, otp: string
     refreshToken,
     offline: decodeJwt(refreshToken).typ === "Offline",
   };
+}
+
+// ---------------------------------------------------------------------------
+// Browser-flow login — the SAME path office.ubeats.mn uses.
+//
+// The ubeats-bo client's BROWSER flow doesn't ask for OTP, but the realm's
+// DIRECT-GRANT flow does for any user who has an authenticator configured
+// (e.g. for the UBCab BO). So a password grant fails for those users even
+// though office.ubeats.mn lets them in with just email + password. To log in
+// exactly like the BO web app, the server plays the browser:
+//
+//   GET  /auth?client_id=ubeats-bo&redirect_uri=https://office.ubeats.mn/&PKCE
+//   POST the Keycloak login form (username/password) with its cookies
+//   ← 302 https://office.ubeats.mn/?code=…   (captured, never followed)
+//   POST /token grant_type=authorization_code + code_verifier
+//
+// redirect_uri is office.ubeats.mn — already registered for ubeats-bo — so no
+// Keycloak change is needed. If Keycloak does show an OTP step, the user's
+// code (if given) is submitted to it. Anything unexpected → "unsupported", and
+// the caller falls back to the direct grant.
+// ---------------------------------------------------------------------------
+
+type BrowserLogin =
+  | { kind: "ok"; accessToken: string; refreshToken: string }
+  | { kind: "bad_credentials"; message: string }
+  | { kind: "otp_required"; message: string }
+  | { kind: "unsupported"; reason: string };
+
+function htmlDecode(s: string): string {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&#x27;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+}
+
+function attr(tag: string, name: string): string | null {
+  const m = new RegExp(`\\b${name}\\s*=\\s*("([^"]*)"|'([^']*)')`, "i").exec(tag);
+  return m ? htmlDecode(m[2] ?? m[3] ?? "") : null;
+}
+
+interface ParsedForm {
+  action: string;
+  fields: Record<string, string>;
+  names: Set<string>;
+  id: string;
+}
+
+/** Forms whose action points at Keycloak's login-actions endpoint. */
+function loginForms(html: string, baseUrl: string): ParsedForm[] {
+  const out: ParsedForm[] = [];
+  const re = /<form\b([^>]*)>([\s\S]*?)<\/form>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    const action = attr(m[1], "action");
+    if (!action || !/login-actions\//.test(action)) continue;
+    const fields: Record<string, string> = {};
+    const names = new Set<string>();
+    const inputRe = /<input\b([^>]*)>/gi;
+    let im: RegExpExecArray | null;
+    while ((im = inputRe.exec(m[2]))) {
+      const name = attr(im[1], "name");
+      if (!name) continue;
+      names.add(name);
+      const type = (attr(im[1], "type") ?? "text").toLowerCase();
+      if (type === "checkbox" || type === "radio") {
+        if (/\bchecked\b/i.test(im[1])) fields[name] = attr(im[1], "value") ?? "on";
+      } else if (type !== "submit") {
+        fields[name] = attr(im[1], "value") ?? "";
+      }
+    }
+    out.push({ action: new URL(action, baseUrl).toString(), fields, names, id: attr(m[1], "id") ?? "" });
+  }
+  return out;
+}
+
+/** Best-effort text of Keycloak's error banner / field error. */
+function kcErrorText(html: string): string | null {
+  const pats = [
+    /<span[^>]*id="input-error[^"]*"[^>]*>([\s\S]*?)<\/span>/i,
+    /<span[^>]*class="[^"]*kc-feedback-text[^"]*"[^>]*>([\s\S]*?)<\/span>/i,
+    /<div[^>]*class="[^"]*alert-(?:error|danger|warning)[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
+    /<p[^>]*class="[^"]*instruction[^"]*"[^>]*>([\s\S]*?)<\/p>/i,
+  ];
+  for (const p of pats) {
+    const m = p.exec(html);
+    if (m) {
+      const t = htmlDecode(m[1].replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+      if (t) return t;
+    }
+  }
+  return null;
+}
+
+class CookieJar {
+  private jar = new Map<string, string>();
+  take(res: Response): void {
+    const h = res.headers as Headers & { getSetCookie?: () => string[] };
+    const list = typeof h.getSetCookie === "function" ? h.getSetCookie() : (res.headers.get("set-cookie") ?? "").split(/,(?=\s*[A-Za-z0-9_\-]+=)/);
+    for (const c of list) {
+      const first = c.split(";")[0] ?? "";
+      const eq = first.indexOf("=");
+      if (eq <= 0) continue;
+      const k = first.slice(0, eq).trim();
+      const v = first.slice(eq + 1).trim();
+      if (/max-age=0\b/i.test(c) || /expires=Thu, 01 Jan 1970/i.test(c)) this.jar.delete(k);
+      else this.jar.set(k, v);
+    }
+  }
+  header(): string {
+    return [...this.jar].map(([k, v]) => `${k}=${v}`).join("; ");
+  }
+}
+
+async function keycloakBrowserLogin(username: string, password: string, otp: string): Promise<BrowserLogin> {
+  const kc = kcConfig();
+  const realmBase = `${kc.ssoUrl}/realms/${encodeURIComponent(kc.realm)}`;
+  const redirectUri = `${kc.origin}/`;
+  const verifier = randomBytes(32).toString("base64url");
+  const challenge = createHash("sha256").update(verifier).digest("base64url");
+  const state = randomBytes(12).toString("base64url");
+  const jar = new CookieJar();
+  const UA = "Mozilla/5.0 (ubeats-bo-mcp) AppleWebKit/537.36 Chrome/124 Safari/537.36";
+
+  const authUrl = new URL(`${realmBase}/protocol/openid-connect/auth`);
+  authUrl.search = new URLSearchParams({
+    client_id: kc.clientId,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    response_mode: "query",
+    scope: "openid offline_access",
+    state,
+    nonce: randomBytes(12).toString("base64url"),
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    prompt: "login",
+  }).toString();
+
+  const get = async (url: string) => {
+    const res = await fetch(url, { method: "GET", redirect: "manual", headers: { "User-Agent": UA, Accept: "text/html", Cookie: jar.header() } });
+    jar.take(res);
+    return res;
+  };
+  const post = async (url: string, form: Record<string, string>) => {
+    const res = await fetch(url, {
+      method: "POST",
+      redirect: "manual",
+      headers: {
+        "User-Agent": UA,
+        Accept: "text/html",
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: jar.header(),
+        Origin: kc.ssoUrl,
+        Referer: url,
+      },
+      body: new URLSearchParams(form).toString(),
+    });
+    jar.take(res);
+    return res;
+  };
+
+  /** A 302 to office.ubeats.mn/?code=… ends the flow. */
+  const codeFrom = (res: Response): string | null => {
+    const loc = res.headers.get("location");
+    if (!loc || !(res.status >= 300 && res.status < 400)) return null;
+    const u = new URL(loc, realmBase);
+    if (!u.href.startsWith(redirectUri)) return null;
+    if (u.searchParams.get("state") !== state) return null;
+    return u.searchParams.get("code");
+  };
+
+  let res: Response;
+  try {
+    res = await get(authUrl.toString());
+  } catch (err) {
+    return { kind: "unsupported", reason: `auth page unreachable: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  let html = await res.text();
+  if (res.status !== 200) return { kind: "unsupported", reason: `auth page HTTP ${res.status}` };
+  if (/Invalid parameter:\s*redirect_uri/i.test(html)) return { kind: "unsupported", reason: "redirect_uri not allowed" };
+
+  let code: string | null = null;
+  let otpSubmitted = false;
+  let passwordSubmitted = false;
+  for (let step = 0; step < 6 && !code; step++) {
+    const forms = loginForms(html, res.url || authUrl.toString());
+    const pwForm = forms.find((f) => f.names.has("password"));
+    const otpForm = forms.find((f) => f.names.has("otp") || f.names.has("totp"));
+
+    if (pwForm && !otpForm) {
+      if (passwordSubmitted) {
+        return { kind: "bad_credentials", message: kcErrorText(html) ?? "Имэйл эсвэл нууц үг буруу байна." };
+      }
+      passwordSubmitted = true;
+      const userField = pwForm.names.has("username") ? "username" : pwForm.names.has("email") ? "email" : "username";
+      res = await post(pwForm.action, { ...pwForm.fields, [userField]: username, password, credentialId: pwForm.fields.credentialId ?? "" });
+    } else if (otpForm) {
+      if (!otp) {
+        return { kind: "otp_required", message: "Таны BO данс энэ удаа OTP код асууж байна — authenticator апп дээрх 6 оронтой кодоо оруулна уу." };
+      }
+      if (otpSubmitted) {
+        return { kind: "bad_credentials", message: kcErrorText(html) ?? "OTP код буруу байна. Шинэ кодоор дахин оролдоно уу." };
+      }
+      otpSubmitted = true;
+      const otpField = otpForm.names.has("otp") ? "otp" : "totp";
+      res = await post(otpForm.action, { ...otpForm.fields, [otpField]: otp });
+    } else {
+      // Required action (update password, configure OTP, terms…) or an unknown page.
+      const msg = kcErrorText(html);
+      return {
+        kind: "unsupported",
+        reason: msg ? `Keycloak page needs attention: ${msg}` : "unexpected Keycloak page",
+      };
+    }
+
+    code = codeFrom(res);
+    if (code) break;
+    // Follow Keycloak-internal redirects (e.g. to the next login-actions step).
+    let hops = 0;
+    while (res.status >= 300 && res.status < 400 && hops++ < 5) {
+      const loc = res.headers.get("location");
+      if (!loc) break;
+      const next = new URL(loc, realmBase).toString();
+      if (!next.startsWith(kc.ssoUrl)) return { kind: "unsupported", reason: "redirected outside Keycloak without a code" };
+      res = await get(next);
+      code = codeFrom(res);
+      if (code) break;
+    }
+    if (code) break;
+    html = await res.text();
+  }
+  if (!code) return { kind: "unsupported", reason: "no authorization code after login" };
+
+  const tokenRes = await fetch(`${realmBase}/protocol/openid-connect/token`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+      Origin: kc.origin,
+      Referer: redirectUri,
+    },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: kc.clientId,
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: verifier,
+    }).toString(),
+  });
+  const body = ((await safeJson(tokenRes)) ?? {}) as Record<string, any>;
+  if (!tokenRes.ok || !body.access_token || !body.refresh_token) {
+    return { kind: "unsupported", reason: `code exchange HTTP ${tokenRes.status} ${body.error ?? ""}`.trim() };
+  }
+  return { kind: "ok", accessToken: String(body.access_token), refreshToken: String(body.refresh_token) };
+}
+
+/**
+ * Log a connector user in with THEIR credentials. Tries the browser flow
+ * first (what office.ubeats.mn does — no OTP for ubeats-bo), then the direct
+ * grant as a fallback when the browser flow can't be driven.
+ */
+async function keycloakUserLogin(username: string, password: string, otp: string): Promise<UserLogin> {
+  let browser: BrowserLogin;
+  try {
+    browser = await keycloakBrowserLogin(username, password, otp);
+  } catch (err) {
+    browser = { kind: "unsupported", reason: err instanceof Error ? err.message : String(err) };
+  }
+  if (browser.kind === "ok") {
+    const claims = decodeJwt(browser.accessToken);
+    return {
+      email: String(claims.email || claims.preferred_username || username).toLowerCase(),
+      name: String(claims.name || claims.preferred_username || username),
+      refreshToken: browser.refreshToken,
+      offline: decodeJwt(browser.refreshToken).typ === "Offline",
+    };
+  }
+  if (browser.kind === "bad_credentials" || browser.kind === "otp_required") {
+    throw new BOError(browser.message, 401, { error: "invalid_grant", flow: "browser", kind: browser.kind });
+  }
+  console.error(`[ubeats-bo-mcp] browser-flow login unavailable (${browser.reason}); falling back to direct grant`);
+  try {
+    return await keycloakDirectGrantLogin(username, password, otp);
+  } catch (err) {
+    // Surface why the normal (browser) path was skipped — it's the only clue
+    // available from the login page when Vercel logs aren't at hand. Non-secret.
+    if (err instanceof BOError) {
+      throw new BOError(`${err.message} [тех.: ${AUTH_BUILD}; browser flow: ${browser.reason}]`, err.status, err.body);
+    }
+    throw err;
+  }
 }
 
 /**
@@ -1243,8 +1536,8 @@ button{margin-top:1.25rem;width:100%;padding:.65rem;border:0;border-radius:8px;b
 <input id="em" type="email" name="email" autocomplete="username" value="${escapeHtml(email)}" ${email ? "" : "autofocus"} required>
 <label for="pw">Нууц үг</label>
 <input id="pw" type="password" name="password" autocomplete="current-password" ${email && !opts.askOtp ? "autofocus" : ""} required>
-<label for="otp">OTP код <span class="opt">${opts.askOtp ? "— authenticator апп дээрх 6 орон" : "(шаардлагатай бол)"}</span></label>
-<input id="otp" type="text" name="otp" inputmode="numeric" pattern="[0-9]{6,8}" maxlength="8" autocomplete="one-time-code" ${opts.askOtp ? "autofocus" : ""} placeholder="123456">
+${opts.askOtp ? `<label for="otp">OTP код <span class="opt">— authenticator апп дээрх 6 орон</span></label>
+<input id="otp" type="text" name="otp" inputmode="numeric" pattern="[0-9]{6,8}" maxlength="8" autocomplete="one-time-code" autofocus required placeholder="123456">` : ""}
 ${opts.error ? `<div class="err">${escapeHtml(opts.error)}</div>` : ""}
 <button type="submit">Нэвтрэх ба зөвшөөрөх</button></form>
 <p class="muted">Холболт таны эрхээр ажиллана — BO дээр танд харагддаг өгөгдөл л нээгдэнэ. Нууц үг хадгалагдахгүй; зөвхөн нэг удаа Keycloak руу дамжина.</p>
@@ -1361,8 +1654,11 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
         login = await keycloakUserLogin(email, form.password ?? "", otp);
       } catch (err) {
         const msg = err instanceof Error && err.message ? err.message : String(err);
-        const isCred = err instanceof BOError && (err.body as any)?.error === "invalid_grant";
-        sendHtml(res, 401, authorizePage(params, { error: msg, email, askOtp: isCred }));
+        const b = err instanceof BOError ? (err.body as any) : null;
+        // Show the OTP field only when Keycloak actually asked for a code (or the
+        // user already typed one) — office.ubeats.mn itself doesn't use OTP.
+        const askOtp = b?.kind === "otp_required" || (!!otp && b?.error === "invalid_grant") || (b?.flow !== "browser" && b?.error === "invalid_grant");
+        sendHtml(res, 401, authorizePage(params, { error: msg, email, askOtp }));
         return;
       }
       // Re-check against the identity Keycloak actually verified.
