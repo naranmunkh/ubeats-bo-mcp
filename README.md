@@ -6,36 +6,48 @@ MCP server for the **UBEats Backoffice** (`office.ubeats.mn`, API host
 (local / Claude Desktop) or as a bearer-guarded Streamable HTTP endpoint on
 Vercel.
 
-## Auth — OTP (authenticator app) since 2026-10
+## Auth — every user signs in with their own BO account
 
-The `ubcab-bo` realm now requires a 6-digit authenticator-app code at login.
-A server can't produce a 30-second code, so **password grant no longer works**
-(Keycloak answers `invalid_grant: Invalid user credentials`).
+When someone adds the connector in Claude and presses **Connect**, the server's
+`/authorize` page asks for their **BO email + password** (and a 6-digit **OTP**
+only if their account has an authenticator configured). The server sends those
+once to Keycloak (direct grant, client `ubeats-bo`, `scope=openid
+offline_access`), checks the email **Keycloak verified** against
+`UBEATS_BO_ALLOWED_EMAILS`, and hands Claude a sealed token. From then on every
+tool call runs **with that user's own BO permissions** — two people asking the
+same question can get different answers, exactly as in office.ubeats.mn.
 
-Production auth is an **offline refresh token** you mint once on your Mac:
+- **The password is never stored or logged** — it's used for that one Keycloak
+  call. Only the user's Keycloak offline refresh token is kept, and only inside
+  AES-256-GCM sealed tokens (codes, access, refresh) keyed off
+  `UBEATS_BO_MCP_AUTH_TOKEN`. Rotating that secret logs everyone out.
+- **Allowlist is fail-closed**: `UBEATS_BO_ALLOWED_EMAILS` takes full emails,
+  `@ubcab.mn` (whole domain) or `*` (any BO user). Empty → nobody can connect.
+  It's re-checked on every request, so removing an email cuts access at once.
+- **How long a connection lasts**: Claude's access token is 12h and silently
+  refreshed; each refresh does a real Keycloak round-trip. The connection lives
+  as long as the user's Keycloak offline session (default: until 30 days
+  unused; ended by a password change or "sign out all sessions"). When it ends,
+  `/mcp` answers 401 and the tools say: *Settings → Connectors → UBEats BO →
+  Disconnect → Connect*.
+- **OTP**: office.ubeats.mn's own login doesn't ask for OTP, but Keycloak's
+  direct-grant flow does for users who have an authenticator set up (e.g. for
+  the UBCab BO). Leave the field empty first; if the login fails the page asks
+  for the code.
 
-```bash
-npm run login
-```
+Vercel env for this mode:
 
-It asks for the 6-digit code (password is read from `.env` if present,
-otherwise prompted without echo), requests `scope=openid offline_access`,
-proves the token by refreshing it and calling the API, then writes
-`UBEATS_BO_REFRESH_TOKEN` into `.env` and copies it to the clipboard. The token
-is never printed.
+| Variable | |
+|---|---|
+| `UBEATS_BO_MCP_AUTH_TOKEN` | required — `openssl rand -hex 32` |
+| `UBEATS_BO_ALLOWED_EMAILS` | required — e.g. `naranmunkh@ubcab.mn, someone@ubcab.mn` or `@ubcab.mn` |
+| `UBEATS_BO_PASSWORD`, `UBEATS_BO_USERNAME` | **delete** — no longer used on Vercel |
+| `UBEATS_BO_REFRESH_TOKEN` | optional — service account for the break-glass bearer only |
 
-Then in Vercel → `ubeats-bo-mcp` → Settings → Environment Variables:
-set `UBEATS_BO_REFRESH_TOKEN` (Production + Preview), delete
-`UBEATS_BO_PASSWORD`, and **Redeploy** (env changes need a new deployment).
-
-The offline token lives until it goes unused for the realm's *Offline Session
-Idle* (Keycloak default 30 days); every MCP call extends it. It is revoked by a
-password change or an admin "sign out all sessions". When it dies the tools
-return an error that says exactly this — rerun `npm run login`.
-
-`npm run login:bo` does the same for the UBCab BO (`bo-mcp`, client
-`ubcab-registration-bo`) and writes `UBCAB_BO_REFRESH_TOKEN` — paste that into
-the **bo-mcp** Vercel project instead.
+**Break-glass / stdio:** sending the raw `UBEATS_BO_MCP_AUTH_TOKEN` as the bearer
+(or `/mcp/<token>`) skips the per-user login and uses the service account from
+`UBEATS_BO_REFRESH_TOKEN` (mint it with `npm run login`). stdio mode always uses
+the service account.
 
 ### Keycloak details
 
@@ -133,8 +145,8 @@ to it. Three rules carried over from `ubcab-bo-mcp` (learned the hard way):
 
 Deploy by pushing to `main` (git integration), not from the CLI.
 
-Env vars to set in Vercel: `UBEATS_BO_REFRESH_TOKEN` (from `npm run login`),
-`UBEATS_BO_MCP_AUTH_TOKEN` (`openssl rand -hex 32`).
+Env vars to set in Vercel: `UBEATS_BO_MCP_AUTH_TOKEN` and
+`UBEATS_BO_ALLOWED_EMAILS` (see the Auth section).
 
 Health check: `GET /health` → `{"status":"ok","server":"ubeats-bo-mcp"}`
 

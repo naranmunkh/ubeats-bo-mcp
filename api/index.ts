@@ -6,45 +6,43 @@
  * https://ubeats-bo-api.ubcabtech.com.
  *
  * Runs two ways from this one file:
- *   - HTTP mode  (Vercel): serves the MCP over Streamable HTTP at /mcp,
- *     guarded by a bearer token + OAuth 2.1 (PKCE).
- *   - stdio mode (local / Claude Desktop): when run directly.
+ *   - HTTP mode (Vercel): Streamable HTTP at /mcp behind OAuth 2.1 (PKCE).
+ *     EACH USER SIGNS IN WITH THEIR OWN BO ACCOUNT on /authorize (email +
+ *     password + optional OTP → Keycloak direct grant, scope offline_access),
+ *     gated by UBEATS_BO_ALLOWED_EMAILS. Tool calls then run with that user's
+ *     own BO permissions. See the "HTTP mode" section below.
+ *   - stdio mode (local / Claude Desktop): when run directly; uses the env
+ *     service account.
  *
  * SELF-CONTAINED ON PURPOSE: no relative imports, so neither Vercel's bundler
  * nor Node's ESM loader has to resolve sibling ".ts"/".js" files.
  *
- * Auth (verified 2026-08-18 against a live office.ubeats.mn session):
- *   Keycloak SSO, issuer https://sso.ubcabtech.com/realms/ubcab-bo
- *   OIDC client (azp): "ubeats-bo"
- *   Token endpoint: {SSO_URL}/realms/{REALM}/protocol/openid-connect/token
- *   Access tokens live ~5 min; this server caches until ~30s before expiry and
- *   silently re-auths (refresh_token first, then password grant).
- *   Every API call sends Origin/Referer = https://office.ubeats.mn so the BO's
- *   allowed-origins check passes.
+ * Keycloak (verified 2026-08-18 from a live office.ubeats.mn session):
+ *   issuer https://sso.ubcabtech.com/realms/ubcab-bo, OIDC client "ubeats-bo",
+ *   Origin/Referer https://office.ubeats.mn. Access tokens live ~5 min and are
+ *   refreshed silently. office.ubeats.mn's browser login doesn't ask for OTP,
+ *   but the realm's DIRECT-GRANT flow asks for it when the user has an
+ *   authenticator configured (e.g. for the UBCab BO) — hence the optional field.
  *
- * ⚠ OTP (2026-10): the ubcab-bo realm now requires an authenticator-app OTP.
- *   Password grant without a code is rejected, and a server can't supply a
- *   30-second code. So production auth = an OFFLINE refresh token obtained once
- *   with `npm run login` (password + OTP, scope offline_access). Offline tokens
- *   survive SSO logout and live until unused for the realm's Offline Session
- *   Idle (Keycloak default 30 days) — each MCP call refreshes it.
- *
- * Env:
- *   UBEATS_BO_REFRESH_TOKEN                  offline token from `npm run login` (REQUIRED with OTP)
- *   UBEATS_BO_USERNAME, UBEATS_BO_PASSWORD   password grant — only for accounts WITHOUT OTP
- *   UBEATS_BO_CLIENT_ID                      OIDC client (default ubeats-bo)
- *   UBEATS_BO_SSO_URL                        Keycloak base (default https://sso.ubcabtech.com)
- *   UBEATS_BO_REALM                          realm (default ubcab-bo)
- *   UBEATS_BO_API_URL                        API base (default https://ubeats-bo-api.ubcabtech.com)
- *   UBEATS_BO_ORIGIN                         Origin/Referer (default https://office.ubeats.mn)
- *   UBEATS_BO_MCP_AUTH_TOKEN                 required in HTTP mode (fails closed)
+ * Env (HTTP mode):
+ *   UBEATS_BO_MCP_AUTH_TOKEN    REQUIRED. Secret that seals OAuth codes/tokens
+ *                               (AES-256-GCM); also a break-glass bearer that
+ *                               uses the service account. `openssl rand -hex 32`
+ *   UBEATS_BO_ALLOWED_EMAILS    REQUIRED. Who may connect: emails, "@ubcab.mn"
+ *                               (whole domain) or "*" (any BO user). Empty → nobody.
+ * Env (service account — stdio and break-glass only):
+ *   UBEATS_BO_REFRESH_TOKEN     offline token from `npm run login`
+ *   UBEATS_BO_USERNAME/PASSWORD password grant — only for accounts without OTP
+ * Env (overrides, defaults are production):
+ *   UBEATS_BO_CLIENT_ID (ubeats-bo), UBEATS_BO_SSO_URL, UBEATS_BO_REALM,
+ *   UBEATS_BO_API_URL, UBEATS_BO_ORIGIN
  *
  * UBEATS_USERNAME / UBEATS_PASSWORD are accepted as fallbacks so this server can
  * share the env already set up for ubcab-bo-mcp.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { timingSafeEqual, createHmac, createHash } from "node:crypto";
+import { timingSafeEqual, createHash, createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -93,6 +91,24 @@ interface AuthConfig {
   realm: string;
   apiUrl: string;
   origin: string;
+  /**
+   * "service": the env account (stdio / break-glass) — failures point at `npm run login`.
+   * "user": a connector user's own Keycloak session — failures mean "reconnect".
+   */
+  mode?: "service" | "user";
+}
+
+/** The caller's Keycloak session is gone (offline token expired/revoked). */
+class SessionExpiredError extends BOError {
+  constructor(status?: number, body?: unknown) {
+    super(
+      "BO-гийн нэвтрэлт дууссан байна. Claude → Settings → Connectors → UBEats BO → " +
+        "Disconnect, дараа нь Connect дарж өөрийн BO эрхээр дахин нэвтэрнэ үү.",
+      status,
+      body
+    );
+    this.name = "SessionExpiredError";
+  }
 }
 
 class UBEatsBOClient {
@@ -119,6 +135,11 @@ class UBEatsBOClient {
     return this.apiUrl;
   }
 
+  /** Latest refresh token (Keycloak may rotate it on refresh). */
+  get currentRefreshToken(): string {
+    return this.refreshToken;
+  }
+
   /** Get a valid access token, re-authenticating when expired. */
   async getToken(force = false): Promise<string> {
     if (!force && this.token && Date.now() < this.tokenExpiresAt) return this.token;
@@ -143,6 +164,14 @@ class UBEatsBOClient {
         });
       } catch (err) {
         refreshErr = err;
+        if (this.cfg.mode === "user") {
+          const b = err instanceof BOError ? err : null;
+          // invalid_grant = session gone; anything else (network, 5xx) is transient.
+          const e = (b?.body as any)?.error;
+          if (e === "invalid_grant" || e === "invalid_token" || b?.status === 400 || b?.status === 401)
+            throw new SessionExpiredError(b?.status, b?.body);
+          throw err;
+        }
         if (!hasPassword) throw otpHelp(err, "refresh");
         // fall through to password grant (works only for accounts without OTP)
       }
@@ -324,6 +353,132 @@ function getClient(): UBEatsBOClient {
   return cachedClient;
 }
 
+/** Vercel keeps blank variables — treat "" / whitespace as unset. */
+function envOr(...namesThenFallback: string[]): string {
+  const fallback = namesThenFallback[namesThenFallback.length - 1];
+  for (const n of namesThenFallback.slice(0, -1)) {
+    const v = (process.env[n] ?? "").trim();
+    if (v) return v;
+  }
+  return fallback;
+}
+
+function kcConfig() {
+  return {
+    ssoUrl: envOr("UBEATS_BO_SSO_URL", DEFAULT_SSO_URL).replace(/\/+$/, ""),
+    realm: envOr("UBEATS_BO_REALM", DEFAULT_REALM),
+    clientId: envOr("UBEATS_BO_CLIENT_ID", "UBEATS_CLIENT_ID", DEFAULT_CLIENT_ID),
+    origin: envOr("UBEATS_BO_ORIGIN", DEFAULT_ORIGIN).replace(/\/+$/, ""),
+    apiUrl: envOr("UBEATS_BO_API_URL", "UBEATS_API_URL", DEFAULT_API_URL),
+  };
+}
+
+function decodeJwt(token: string): Record<string, any> {
+  try {
+    return JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
+  } catch {
+    return {};
+  }
+}
+
+interface UserLogin {
+  email: string;
+  name: string;
+  refreshToken: string;
+  offline: boolean;
+}
+
+/**
+ * Log a connector user into Keycloak with THEIR credentials (direct grant).
+ * `otp` is optional: Keycloak's direct-grant flow asks for it only when the
+ * user has an authenticator configured — even if office.ubeats.mn's own
+ * browser login doesn't. Asks for offline_access so the connection survives
+ * SSO logout and lasts until unused for Offline Session Idle (default 30 days).
+ */
+async function keycloakUserLogin(username: string, password: string, otp: string): Promise<UserLogin> {
+  const kc = kcConfig();
+  const tokenUrl = `${kc.ssoUrl}/realms/${encodeURIComponent(kc.realm)}/protocol/openid-connect/token`;
+  const post = async (scope: string) => {
+    const params: Record<string, string> = {
+      grant_type: "password",
+      client_id: kc.clientId,
+      username,
+      password,
+      scope,
+    };
+    if (otp) {
+      params.otp = otp;
+      params.totp = otp; // Keycloak < 12
+    }
+    const res = await fetch(tokenUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+        Origin: kc.origin,
+        Referer: `${kc.origin}/`,
+      },
+      body: new URLSearchParams(params).toString(),
+    });
+    return { res, body: ((await safeJson(res)) ?? {}) as Record<string, any> };
+  };
+  let { res, body } = await post("openid offline_access");
+  if (!res.ok && body.error === "invalid_scope") ({ res, body } = await post("openid"));
+  if (!res.ok) {
+    const e = body.error;
+    let msg: string;
+    if (e === "invalid_grant")
+      msg = otp
+        ? "Имэйл, нууц үг эсвэл OTP код буруу байна. OTP 30 секунд тутам солигддог — шинэ кодоор дахин оролдоно уу."
+        : "Имэйл эсвэл нууц үг буруу байна. Хэрэв таны BO данс authenticator апп (OTP) ашигладаг бол 6 оронтой кодоо доор оруулна уу.";
+    else if (e === "user_disabled" || /disabled/i.test(String(body.error_description ?? "")))
+      msg = "Таны BO данс идэвхгүй болсон байна.";
+    else if (e === "unauthorized_client")
+      msg = "BO-гийн тохиргоо нууц үгээр нэвтрэхийг хаасан байна (direct grant). UBCab tech багт хандана уу.";
+    else msg = `BO нэвтрэлт амжилтгүй (HTTP ${res.status}${e ? `, ${e}` : ""}).`;
+    throw new BOError(msg, res.status, body);
+  }
+  const claims = decodeJwt(String(body.access_token ?? ""));
+  const refreshToken = String(body.refresh_token ?? "");
+  if (!refreshToken) throw new BOError("Keycloak refresh token буцаасангүй.", res.status);
+  return {
+    email: String(claims.email || claims.preferred_username || username).toLowerCase(),
+    name: String(claims.name || claims.preferred_username || username),
+    refreshToken,
+    offline: decodeJwt(refreshToken).typ === "Offline",
+  };
+}
+
+/**
+ * Per-user clients, keyed by a hash of the user's refresh token, so a warm
+ * serverless instance reuses each user's 5-minute access token instead of
+ * hitting Keycloak on every MCP request.
+ */
+const userClients = new Map<string, UBEatsBOClient>();
+function userClient(refreshToken: string): UBEatsBOClient {
+  const key = createHash("sha256").update(refreshToken).digest("base64url");
+  let c = userClients.get(key);
+  if (c) {
+    userClients.delete(key); // re-insert → most recently used last
+  } else {
+    const kc = kcConfig();
+    c = new UBEatsBOClient({
+      username: "",
+      password: "",
+      refreshToken,
+      clientId: kc.clientId,
+      ssoUrl: kc.ssoUrl,
+      realm: kc.realm,
+      apiUrl: kc.apiUrl,
+      origin: kc.origin,
+      mode: "user",
+    });
+  }
+  userClients.set(key, c);
+  while (userClients.size > 200) userClients.delete(userClients.keys().next().value as string);
+  return c;
+}
+
 // ===========================================================================
 // Shared schema fragments
 // ===========================================================================
@@ -345,9 +500,8 @@ const objectIdSchema = z
   .min(1)
   .describe("Mongo ObjectId (ж: 68a1f0c2b3d4e5f60718293a). Холбогдох *_search tool-ын хариунаас _id-г ав.");
 
-function createMcpServer(): McpServer {
-  const server = new McpServer({ name: "ubeats-bo-mcp", version: "1.0.0" });
-  const client = getClient();
+function createMcpServer(client: UBEatsBOClient): McpServer {
+  const server = new McpServer({ name: "ubeats-bo-mcp", version: "1.1.0" });
 
   const reg = (
     name: string,
@@ -731,17 +885,107 @@ function createMcpServer(): McpServer {
 }
 
 // ===========================================================================
-// HTTP mode (Vercel) — bearer-guarded Streamable HTTP + OAuth 2.1 (PKCE)
+// HTTP mode (Vercel) — OAuth 2.1 (PKCE) where each user signs in with THEIR
+// OWN BO account, plus an email allowlist.
+//
+//   Claude → /authorize (our page: BO email + password + optional OTP)
+//          → Keycloak direct grant (scope offline_access) with those creds
+//          → allowlist check on the VERIFIED email from Keycloak's token
+//          → sealed auth code → /token → sealed access + refresh tokens.
+//
+// The user's Keycloak refresh token travels only inside AES-256-GCM sealed
+// tokens (key derived from UBEATS_BO_MCP_AUTH_TOKEN). The password is used
+// once for the Keycloak call and never stored or logged. Every MCP request
+// runs with the caller's own BO permissions.
+//
+// Break-glass: the raw UBEATS_BO_MCP_AUTH_TOKEN as a bearer (or /mcp/<token>)
+// still works and uses the env service account (UBEATS_BO_REFRESH_TOKEN).
 // ===========================================================================
 
-function tokenMatches(provided: string | null | undefined): boolean {
-  const expected = process.env.UBEATS_BO_MCP_AUTH_TOKEN;
-  if (!expected || !provided) return false; // fail closed
-  const a = Buffer.from(provided);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+const ACCESS_TTL_MS = 12 * 60 * 60 * 1000; // 12h; the allowlist is re-checked on every request anyway
+const REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30d ≈ Keycloak Offline Session Idle
+const CODE_TTL_MS = 5 * 60 * 1000;
+
+function signingSecret(): string {
+  return (process.env.UBEATS_BO_MCP_AUTH_TOKEN ?? "").trim();
 }
+
+function constantTimeEquals(a: string, b: string): boolean {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  if (x.length !== y.length) return false;
+  return timingSafeEqual(x, y);
+}
+
+/** Break-glass bearer: the raw UBEATS_BO_MCP_AUTH_TOKEN (uses env credentials). */
+function tokenMatches(provided: string | null | undefined): boolean {
+  const expected = signingSecret();
+  if (!expected || !provided) return false; // fail closed
+  return constantTimeEquals(provided, expected);
+}
+
+/**
+ * UBEATS_BO_ALLOWED_EMAILS: comma/space separated. Entries are full emails,
+ * "@domain.mn" (whole domain) or "*" (any BO user). Empty → nobody (fail closed).
+ */
+function allowlist(): string[] {
+  return (process.env.UBEATS_BO_ALLOWED_EMAILS ?? "")
+    .split(/[,;\s]+/)
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function emailAllowed(email: string): boolean {
+  const list = allowlist();
+  if (list.length === 0) return false;
+  const e = email.trim().toLowerCase();
+  if (!e.includes("@")) return list.includes("*");
+  const domain = e.slice(e.indexOf("@"));
+  return list.some((entry) => entry === "*" || (entry.startsWith("@") ? entry === domain : entry === e));
+}
+
+// ---- sealed tokens (AES-256-GCM) -----------------------------------------
+
+function sealKey(): Buffer {
+  return createHash("sha256").update(`ubeats-bo-mcp/seal/v1/${signingSecret()}`).digest();
+}
+
+function seal(obj: Record<string, unknown>): string {
+  const iv = randomBytes(12);
+  const c = createCipheriv("aes-256-gcm", sealKey(), iv);
+  const ct = Buffer.concat([c.update(JSON.stringify(obj), "utf8"), c.final()]);
+  return `u1.${Buffer.concat([iv, ct, c.getAuthTag()]).toString("base64url")}`;
+}
+
+function unseal(token: string | null | undefined, type: "code" | "at" | "rt"): Record<string, any> | null {
+  if (!token || !token.startsWith("u1.") || !signingSecret()) return null;
+  try {
+    const raw = Buffer.from(token.slice(3), "base64url");
+    if (raw.length < 12 + 16 + 2) return null;
+    const d = createDecipheriv("aes-256-gcm", sealKey(), raw.subarray(0, 12));
+    d.setAuthTag(raw.subarray(raw.length - 16));
+    const pt = Buffer.concat([d.update(raw.subarray(12, raw.length - 16)), d.final()]).toString("utf8");
+    const obj = JSON.parse(pt);
+    if (obj.t !== type) return null;
+    if (typeof obj.exp !== "number" || Date.now() > obj.exp) return null;
+    return obj;
+  } catch {
+    return null; // tampered, wrong key, or garbage
+  }
+}
+
+function mintTokens(email: string, refreshToken: string) {
+  const now = Date.now();
+  return {
+    access_token: seal({ t: "at", em: email, rt: refreshToken, exp: now + ACCESS_TTL_MS }),
+    refresh_token: seal({ t: "rt", em: email, rt: refreshToken, exp: now + REFRESH_TTL_MS }),
+    token_type: "Bearer",
+    expires_in: Math.floor(ACCESS_TTL_MS / 1000),
+    scope: "mcp",
+  };
+}
+
+// ---- small HTTP helpers --------------------------------------------------
 
 function bearerToken(req: IncomingMessage): string | null {
   const raw = req.headers["authorization"] ?? "";
@@ -758,12 +1002,18 @@ function pathToken(url: URL): string | null {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "Content-Type": "application/json" });
+  res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
   res.end(JSON.stringify(body));
 }
 
 function sendHtml(res: ServerResponse, status: number, html: string): void {
-  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
+  res.writeHead(status, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https: http://localhost:* http://127.0.0.1:*; frame-ancestors 'none'",
+    "Referrer-Policy": "no-referrer",
+  });
   res.end(html);
 }
 
@@ -795,52 +1045,9 @@ async function readForm(req: IncomingMessage): Promise<Record<string, string>> {
   return out;
 }
 
-function hmac(data: string): string {
-  return createHmac("sha256", process.env.UBEATS_BO_MCP_AUTH_TOKEN ?? "").update(data).digest("base64url");
-}
-
-function signPayload(obj: unknown): string {
-  const p = Buffer.from(JSON.stringify(obj)).toString("base64url");
-  return `${p}.${hmac(p)}`;
-}
-
-function verifySigned(token: string): Record<string, any> | null {
-  const dot = token.lastIndexOf(".");
-  if (dot < 0) return null;
-  const p = token.slice(0, dot);
-  const sig = token.slice(dot + 1);
-  const expected = hmac(p);
-  const a = Buffer.from(sig);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
-  try {
-    const obj = JSON.parse(Buffer.from(p, "base64url").toString("utf8"));
-    if (typeof obj.exp === "number" && Date.now() > obj.exp) return null;
-    return obj;
-  } catch {
-    return null;
-  }
-}
-
-function mintAuthCode(redirectUri: string, codeChallenge: string): string {
-  return signPayload({ t: "code", ru: redirectUri, cc: codeChallenge, exp: Date.now() + 5 * 60 * 1000 });
-}
-
-function mintAccessToken(): string {
-  return signPayload({ t: "at", sub: "ubcab-bo", exp: Date.now() + 30 * 24 * 60 * 60 * 1000 });
-}
-
-function isValidAccessToken(token: string | null | undefined): boolean {
-  if (!token) return false;
-  const obj = verifySigned(token);
-  return !!obj && obj.t === "at";
-}
-
 function pkceOk(verifier: string, challenge: string): boolean {
   const h = createHash("sha256").update(verifier).digest("base64url");
-  const a = Buffer.from(h);
-  const b = Buffer.from(challenge);
-  return a.length === b.length && timingSafeEqual(a, b);
+  return constantTimeEquals(h, challenge);
 }
 
 function baseUrl(req: IncomingMessage): string {
@@ -855,23 +1062,57 @@ function escapeHtml(s: string): string {
   );
 }
 
-function authorizePage(params: URLSearchParams, error?: string): string {
-  const hidden = ["client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method", "scope", "response_type"]
-    .map((k) => `<input type="hidden" name="${k}" value="${escapeHtml(params.get(k) ?? "")}">`)
-    .join("\n");
+const OAUTH_PARAMS = ["client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method", "scope", "response_type"];
+
+/** Only hand codes to https redirect targets (or loopback for local clients). */
+function redirectAllowed(uri: string): boolean {
+  try {
+    const u = new URL(uri);
+    if (u.protocol === "https:") return true;
+    return u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1");
+  } catch {
+    return false;
+  }
+}
+
+function authorizePage(params: URLSearchParams, opts: { error?: string; email?: string; askOtp?: boolean } = {}): string {
+  const hidden = OAUTH_PARAMS.map(
+    (k) => `<input type="hidden" name="${k}" value="${escapeHtml(params.get(k) ?? "")}">`
+  ).join("\n");
+  const email = opts.email ?? "";
   return `<!doctype html><html lang="mn"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>UBEats BO MCP — Нэвтрэх</title>
-<style>body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;max-width:380px;margin:5rem auto;padding:0 1.25rem;color:#1a1a1a}
-h1{font-size:1.25rem}label{display:block;margin:1rem 0 .35rem;font-size:.9rem}
-input[type=password]{width:100%;padding:.6rem;border:1px solid #ccc;border-radius:8px;font-size:1rem;box-sizing:border-box}
-button{margin-top:1rem;width:100%;padding:.65rem;border:0;border-radius:8px;background:#1a1a1a;color:#fff;font-size:1rem;cursor:pointer}
-.err{color:#b00020;font-size:.9rem;margin-top:.75rem}.muted{color:#666;font-size:.85rem;margin-top:1rem}</style></head>
-<body><h1>UBEats BO MCP холболт</h1><p class="muted">UBEats Backoffice MCP сервер рүү холбогдохын тулд хандах түлхүүрээ оруулна уу.</p>
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>UBEats BO — Нэвтрэх</title>
+<style>
+:root{color-scheme:light dark;--fg:#1a1a1a;--muted:#666;--bd:#ccc;--bg:#fff;--btn:#1f8f4e;--err:#b00020}
+@media (prefers-color-scheme:dark){:root{--fg:#eee;--muted:#9a9a9a;--bd:#444;--bg:#161616;--err:#ff6b81}}
+body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;max-width:400px;margin:4rem auto;padding:0 1.25rem;color:var(--fg);background:var(--bg)}
+h1{font-size:1.25rem;margin-bottom:.25rem}label{display:block;margin:1rem 0 .35rem;font-size:.9rem}
+input[type=email],input[type=password],input[type=text]{width:100%;padding:.6rem;border:1px solid var(--bd);border-radius:8px;font-size:1rem;box-sizing:border-box;background:transparent;color:inherit}
+button{margin-top:1.25rem;width:100%;padding:.65rem;border:0;border-radius:8px;background:var(--btn);color:#fff;font-size:1rem;cursor:pointer}
+.err{color:var(--err);font-size:.9rem;margin-top:.75rem}.muted{color:var(--muted);font-size:.85rem;margin-top:.5rem;line-height:1.4}
+.opt{font-weight:400;color:var(--muted)}</style></head>
+<body><h1>UBEats Backoffice MCP</h1>
+<p class="muted">office.ubeats.mn-д нэвтэрдэг <b>өөрийн BO эрхээрээ</b> нэвтэрнэ үү.</p>
 <form method="POST" action="/authorize">${hidden}
-<label for="pw">Хандах түлхүүр (access token)</label>
-<input id="pw" type="password" name="password" autocomplete="off" autofocus required>
-${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
-<button type="submit">Зөвшөөрөх</button></form></body></html>`;
+<label for="em">Имэйл</label>
+<input id="em" type="email" name="email" autocomplete="username" value="${escapeHtml(email)}" ${email ? "" : "autofocus"} required>
+<label for="pw">Нууц үг</label>
+<input id="pw" type="password" name="password" autocomplete="current-password" ${email && !opts.askOtp ? "autofocus" : ""} required>
+<label for="otp">OTP код <span class="opt">${opts.askOtp ? "— authenticator апп дээрх 6 орон" : "(шаардлагатай бол)"}</span></label>
+<input id="otp" type="text" name="otp" inputmode="numeric" pattern="[0-9]{6,8}" maxlength="8" autocomplete="one-time-code" ${opts.askOtp ? "autofocus" : ""} placeholder="123456">
+${opts.error ? `<div class="err">${escapeHtml(opts.error)}</div>` : ""}
+<button type="submit">Нэвтрэх ба зөвшөөрөх</button></form>
+<p class="muted">Холболт таны эрхээр ажиллана — BO дээр танд харагддаг өгөгдөл л нээгдэнэ. Нууц үг хадгалагдахгүй; зөвхөн нэг удаа Keycloak руу дамжина.</p>
+</body></html>`;
+}
+
+/** Write a JSON-RPC 401 that tells the client how to (re)authorize. */
+function sendUnauthorized(req: IncomingMessage, res: ServerResponse, message = "Unauthorized"): void {
+  res.writeHead(401, {
+    "Content-Type": "application/json",
+    "WWW-Authenticate": `Bearer resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource"`,
+  });
+  res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message }, id: null }));
 }
 
 export default async function handler(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -880,19 +1121,26 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   const method = req.method ?? "GET";
 
   if (method === "GET" && path === "/health") {
-    sendJson(res, 200, { status: "ok", server: "ubeats-bo-mcp" });
+    sendJson(res, 200, {
+      status: "ok",
+      server: "ubeats-bo-mcp",
+      auth: "per-user BO login (Keycloak) + email allowlist",
+      allowlistConfigured: allowlist().length > 0,
+      signingSecretConfigured: !!signingSecret(),
+      serviceAccountConfigured: !!envOr("UBEATS_BO_REFRESH_TOKEN", "UBEATS_REFRESH_TOKEN", ""),
+    });
     return;
   }
 
   // ---- OAuth discovery metadata ----
-  if (method === "GET" && path === "/.well-known/oauth-protected-resource") {
+  if (method === "GET" && path.startsWith("/.well-known/oauth-protected-resource")) {
     const base = baseUrl(req);
-    sendJson(res, 200, { resource: `${base}/mcp`, authorization_servers: [base] });
+    sendJson(res, 200, { resource: `${base}/mcp`, authorization_servers: [base], scopes_supported: ["mcp"] });
     return;
   }
   if (
     method === "GET" &&
-    (path === "/.well-known/oauth-authorization-server" || path === "/.well-known/openid-configuration")
+    (path.startsWith("/.well-known/oauth-authorization-server") || path === "/.well-known/openid-configuration")
   ) {
     const base = baseUrl(req);
     sendJson(res, 200, {
@@ -901,7 +1149,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
       token_endpoint: `${base}/token`,
       registration_endpoint: `${base}/register`,
       response_types_supported: ["code"],
-      grant_types_supported: ["authorization_code"],
+      grant_types_supported: ["authorization_code", "refresh_token"],
       code_challenge_methods_supported: ["S256"],
       token_endpoint_auth_methods_supported: ["none"],
       scopes_supported: ["mcp"],
@@ -909,24 +1157,25 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     return;
   }
 
-  // ---- OAuth dynamic client registration ----
+  // ---- OAuth dynamic client registration (public clients, PKCE) ----
   if (method === "POST" && path === "/register") {
     let reg = (req as IncomingMessage & { body?: unknown }).body as Record<string, unknown> | string | undefined;
     if (reg === undefined || typeof reg === "string") reg = (await readBody(req)) as Record<string, unknown>;
     const redirectUris = Array.isArray((reg as any)?.redirect_uris) ? (reg as any).redirect_uris : [];
     sendJson(res, 201, {
       client_id: "ubeats-bo-mcp",
+      client_id_issued_at: Math.floor(Date.now() / 1000),
       token_endpoint_auth_method: "none",
-      grant_types: ["authorization_code"],
+      grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       redirect_uris: redirectUris,
     });
     return;
   }
 
-  // ---- OAuth authorize ----
+  // ---- OAuth authorize: the user's own BO login + allowlist ----
   if (path === "/authorize") {
-    if (!process.env.UBEATS_BO_MCP_AUTH_TOKEN) {
+    if (!signingSecret()) {
       sendJson(res, 500, { error: "server_error", error_description: "UBEATS_BO_MCP_AUTH_TOKEN not set" });
       return;
     }
@@ -937,55 +1186,113 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     if (method === "POST") {
       const form = await readForm(req);
       const params = new URLSearchParams();
-      for (const k of ["client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method", "scope", "response_type"]) {
-        if (form[k] !== undefined) params.set(k, form[k]);
-      }
+      for (const k of OAUTH_PARAMS) if (form[k] !== undefined) params.set(k, form[k]);
       const redirectUri = form.redirect_uri ?? "";
       const codeChallenge = form.code_challenge ?? "";
-      if (!redirectUri || !codeChallenge || form.code_challenge_method !== "S256") {
-        sendHtml(res, 400, authorizePage(params, "Буруу хүсэлт (PKCE S256 шаардлагатай)."));
+      const email = (form.email ?? "").trim();
+      const otp = (form.otp ?? "").replace(/\s+/g, "");
+      if (!redirectUri || !redirectAllowed(redirectUri) || !codeChallenge || form.code_challenge_method !== "S256") {
+        sendHtml(res, 400, authorizePage(params, { error: "Буруу хүсэлт (https redirect_uri ба PKCE S256 шаардлагатай).", email }));
         return;
       }
-      if (!tokenMatches(form.password)) {
-        sendHtml(res, 401, authorizePage(params, "Хандах түлхүүр буруу байна."));
+      if (allowlist().length === 0) {
+        sendHtml(res, 503, authorizePage(params, { error: "Сервер дээр зөвшөөрөгдсөн имэйлийн жагсаалт (UBEATS_BO_ALLOWED_EMAILS) тохируулаагүй байна.", email }));
         return;
       }
-      const code = mintAuthCode(redirectUri, codeChallenge);
+      // Cheap pre-check on the typed email so disallowed users don't hit Keycloak.
+      if (!emailAllowed(email)) {
+        sendHtml(res, 403, authorizePage(params, { error: "Энэ имэйлд MCP-д хандах зөвшөөрөл олгогдоогүй байна.", email }));
+        return;
+      }
+      if (otp && !/^\d{6,8}$/.test(otp)) {
+        sendHtml(res, 400, authorizePage(params, { error: "OTP нь 6 оронтой тоо байна.", email, askOtp: true }));
+        return;
+      }
+      let login: UserLogin;
+      try {
+        login = await keycloakUserLogin(email, form.password ?? "", otp);
+      } catch (err) {
+        const msg = err instanceof Error && err.message ? err.message : String(err);
+        const isCred = err instanceof BOError && (err.body as any)?.error === "invalid_grant";
+        sendHtml(res, 401, authorizePage(params, { error: msg, email, askOtp: isCred }));
+        return;
+      }
+      // Re-check against the identity Keycloak actually verified.
+      if (!emailAllowed(login.email)) {
+        sendHtml(res, 403, authorizePage(params, { error: "Энэ имэйлд MCP-д хандах зөвшөөрөл олгогдоогүй байна.", email }));
+        return;
+      }
+      const code = seal({
+        t: "code",
+        ru: redirectUri,
+        cc: codeChallenge,
+        em: login.email,
+        rt: login.refreshToken,
+        exp: Date.now() + CODE_TTL_MS,
+      });
       const sep = redirectUri.includes("?") ? "&" : "?";
       let location = `${redirectUri}${sep}code=${encodeURIComponent(code)}`;
       if (form.state) location += `&state=${encodeURIComponent(form.state)}`;
-      res.writeHead(302, { Location: location });
+      res.writeHead(302, { Location: location, "Cache-Control": "no-store" });
       res.end();
       return;
     }
   }
 
-  // ---- OAuth token exchange ----
+  // ---- OAuth token endpoint: authorization_code + refresh_token ----
   if (method === "POST" && path === "/token") {
+    if (!signingSecret()) {
+      sendJson(res, 500, { error: "server_error", error_description: "UBEATS_BO_MCP_AUTH_TOKEN not set" });
+      return;
+    }
     const form = await readForm(req);
-    if (form.grant_type !== "authorization_code") {
-      sendJson(res, 400, { error: "unsupported_grant_type" });
+
+    if (form.grant_type === "authorization_code") {
+      const code = unseal(form.code, "code");
+      if (!code) {
+        sendJson(res, 400, { error: "invalid_grant", error_description: "code invalid or expired" });
+        return;
+      }
+      if (form.redirect_uri && form.redirect_uri !== code.ru) {
+        sendJson(res, 400, { error: "invalid_grant", error_description: "redirect_uri mismatch" });
+        return;
+      }
+      if (!form.code_verifier || !pkceOk(form.code_verifier, String(code.cc))) {
+        sendJson(res, 400, { error: "invalid_grant", error_description: "PKCE verification failed" });
+        return;
+      }
+      if (!emailAllowed(String(code.em ?? ""))) {
+        sendJson(res, 403, { error: "access_denied", error_description: "email is not allowed" });
+        return;
+      }
+      sendJson(res, 200, mintTokens(String(code.em), String(code.rt)));
       return;
     }
-    const decoded = form.code ? verifySigned(form.code) : null;
-    if (!decoded || decoded.t !== "code") {
-      sendJson(res, 400, { error: "invalid_grant" });
+
+    if (form.grant_type === "refresh_token") {
+      const rt = unseal(form.refresh_token, "rt");
+      if (!rt || !emailAllowed(String(rt.em ?? ""))) {
+        sendJson(res, 400, { error: "invalid_grant", error_description: "refresh token invalid, expired or email no longer allowed" });
+        return;
+      }
+      // Prove the user's Keycloak session is still alive before re-issuing —
+      // force a real Keycloak round-trip, not the cached 5-minute access token.
+      const client = userClient(String(rt.rt));
+      try {
+        await client.getToken(true);
+      } catch (err) {
+        if (err instanceof SessionExpiredError) {
+          sendJson(res, 400, { error: "invalid_grant", error_description: "BO session expired — sign in again" });
+        } else {
+          sendJson(res, 503, { error: "temporarily_unavailable", error_description: err instanceof Error ? err.message : String(err) });
+        }
+        return;
+      }
+      sendJson(res, 200, mintTokens(String(rt.em), client.currentRefreshToken || String(rt.rt)));
       return;
     }
-    if (form.redirect_uri && form.redirect_uri !== decoded.ru) {
-      sendJson(res, 400, { error: "invalid_grant", error_description: "redirect_uri mismatch" });
-      return;
-    }
-    if (!form.code_verifier || !pkceOk(form.code_verifier, decoded.cc)) {
-      sendJson(res, 400, { error: "invalid_grant", error_description: "PKCE verification failed" });
-      return;
-    }
-    sendJson(res, 200, {
-      access_token: mintAccessToken(),
-      token_type: "Bearer",
-      expires_in: 30 * 24 * 60 * 60,
-      scope: "mcp",
-    });
+
+    sendJson(res, 400, { error: "unsupported_grant_type" });
     return;
   }
 
@@ -1000,7 +1307,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   }
 
   // ---- MCP endpoint (POST /mcp or /mcp/<token>) ----
-  if (!process.env.UBEATS_BO_MCP_AUTH_TOKEN) {
+  if (!signingSecret()) {
     sendJson(res, 500, {
       jsonrpc: "2.0",
       error: { code: -32001, message: "Server misconfigured: UBEATS_BO_MCP_AUTH_TOKEN not set." },
@@ -1009,13 +1316,30 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     return;
   }
   const bearer = bearerToken(req);
-  const authed = isValidAccessToken(bearer) || tokenMatches(bearer) || tokenMatches(pathToken(url));
-  if (!authed) {
-    res.writeHead(401, {
-      "Content-Type": "application/json",
-      "WWW-Authenticate": `Bearer resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource"`,
-    });
-    res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null }));
+  let client: UBEatsBOClient | null = null;
+  const at = unseal(bearer, "at");
+  if (at) {
+    if (!emailAllowed(String(at.em ?? ""))) {
+      sendUnauthorized(req, res, "Энэ имэйлийн MCP эрх цуцлагдсан байна.");
+      return;
+    }
+    client = userClient(String(at.rt));
+    // Fail at the HTTP layer (401 → Claude prompts to reconnect) rather than
+    // inside every tool call when the user's BO session is gone.
+    try {
+      await client.getToken();
+    } catch (err) {
+      if (err instanceof SessionExpiredError) {
+        sendUnauthorized(req, res, err.message);
+        return;
+      }
+      // transient Keycloak trouble: let the tool calls surface it
+    }
+  } else if (tokenMatches(bearer) || tokenMatches(pathToken(url))) {
+    client = getClient(); // break-glass: env service account
+  }
+  if (!client) {
+    sendUnauthorized(req, res);
     return;
   }
 
@@ -1030,7 +1354,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   if (body === undefined) body = await readBody(req);
 
   try {
-    const mcp = createMcpServer();
+    const mcp = createMcpServer(client);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
@@ -1057,7 +1381,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
 // ===========================================================================
 
 async function startStdio(): Promise<void> {
-  const server = createMcpServer();
+  const server = createMcpServer(getClient());
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("ubeats-bo-mcp server running on stdio");
