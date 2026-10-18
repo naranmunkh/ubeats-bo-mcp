@@ -32,8 +32,8 @@ const PRESETS = {
     origin: "https://office.ubeats.mn",
     api: "https://ubeats-bo-api.ubcabtech.com",
     probe: { method: "GET", path: "/v1/api/reports/driver-revenue/meta?action=list" },
-    userVars: ["UBEATS_BO_USERNAME", "UBEATS_USERNAME"],
-    passVars: ["UBEATS_BO_PASSWORD", "UBEATS_PASSWORD"],
+    userVars: ["UBCAB_BO_USERNAME", "UBEATS_BO_USERNAME", "UBEATS_USERNAME"],
+    passVars: ["UBCAB_BO_PASSWORD", "UBEATS_BO_PASSWORD", "UBEATS_PASSWORD"],
   },
   bo: {
     client: "ubcab-registration-bo",

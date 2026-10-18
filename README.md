@@ -42,12 +42,32 @@ Vercel env for this mode:
 | `UBEATS_BO_MCP_AUTH_TOKEN` | required — `openssl rand -hex 32` |
 | `UBEATS_BO_ALLOWED_EMAILS` | required — e.g. `naranmunkh@ubcab.mn, someone@ubcab.mn` or `@ubcab.mn` |
 | `UBEATS_BO_PASSWORD`, `UBEATS_BO_USERNAME` | **delete** — no longer used on Vercel |
-| `UBEATS_BO_REFRESH_TOKEN` | optional — service account for the break-glass bearer only |
+| `UBCAB_BO_USERNAME`, `UBCAB_BO_PASSWORD`, `UBCAB_BO_TOTP_SECRET` | optional — service account, break-glass only (see below) |
+| `UBEATS_BO_REFRESH_TOKEN` | optional — alternative service account, break-glass only |
 
-**Break-glass / stdio:** sending the raw `UBEATS_BO_MCP_AUTH_TOKEN` as the bearer
-(or `/mcp/<token>`) skips the per-user login and uses the service account from
-`UBEATS_BO_REFRESH_TOKEN` (mint it with `npm run login`). stdio mode always uses
-the service account.
+### Service account (stdio and break-glass only)
+
+Sending the raw `UBEATS_BO_MCP_AUTH_TOKEN` as the bearer (or `/mcp/<token>`)
+skips the per-user login and uses one shared service account; stdio mode always
+does. Connector users never touch it. Sources, in order:
+
+1. `UBEATS_BO_REFRESH_TOKEN` — offline token for the `ubeats-bo` client, minted
+   with `npm run login` (a BO token from ubcab-bo-mcp won't work: tokens are
+   bound to the client that issued them).
+2. **The BO login** — the same account and env names as `ubcab-bo-mcp`:
+   `UBCAB_BO_USERNAME` + `UBCAB_BO_PASSWORD` + `UBCAB_BO_TOTP_SECRET` (the base32
+   text under «Unable to scan?» in the authenticator setup; required since the
+   realm enforced OTP on 2026-10-05). Every password grant sends a freshly
+   generated `totp`. A code is single-use and the account is shared with
+   ubcab-bo-mcp and the browser, so if another login spent the current code the
+   server waits for the next 30 s step and retries once (~35 s cold login).
+3. `UBEATS_BO_USERNAME` / `_PASSWORD` / `_TOTP_SECRET` — fallback when no BO login is set.
+
+Check the TOTP generator offline with `npm run test:totp` (RFC 6238 vectors).
+
+Once per-user login works for everyone, the shared password and TOTP secret are
+only needed for break-glass — consider removing them from Vercel, since storing
+a TOTP secret next to the password means that account's 2FA no longer protects it.
 
 ### Keycloak details
 
@@ -126,6 +146,7 @@ headers handled. Use it to probe undocumented endpoints before adding a real too
 npm install
 npm run typecheck
 cp .env.example .env
+npm run test:totp
 npm run login
 npm run test:login
 npm run compile && npm start   # stdio MCP server
@@ -143,12 +164,25 @@ to it. Three rules carried over from `ubcab-bo-mcp` (learned the hard way):
 3. **No imports from `src/`** — esbuild's Node16 resolver won't map `.js` → `.ts`
    and you get a 500. Everything lives in the one file.
 
-Deploy by pushing to `main` (git integration), not from the CLI.
+Deploy by pushing to `master` (git integration), not from the CLI.
 
 Env vars to set in Vercel: `UBEATS_BO_MCP_AUTH_TOKEN` and
 `UBEATS_BO_ALLOWED_EMAILS` (see the Auth section).
 
-Health check: `GET /health` → `{"status":"ok","server":"ubeats-bo-mcp"}`
+Health check: `GET /health` → `{"status":"ok","server":"ubeats-bo-mcp","build":"2026-10-18 per-user-login+bo-totp",…}`
+plus `allowlistConfigured`, `signingSecretConfigured`, `serviceAccountConfigured`.
+
+### Is the latest build live?
+
+- `/health` shows `build`. Missing, or older than the latest commit → an old
+  deploy is serving. Vercel → Deployments: the top Production deployment must be
+  the latest `master` commit ("Redeploy" on an old deployment rebuilds that old
+  source).
+- Every Keycloak auth error ends with a non-secret context, e.g.
+  `[build 2026-10-18 per-user-login+bo-totp, client=ubeats-bo, origin=https://office.ubeats.mn, grant=password, login=UBCAB_BO_*, totp=sent]`.
+  `login=UBEATS_BO_* (fallback…)` → `UBCAB_BO_*` not set on that deployment (env
+  changes need a new deploy); `totp=not configured` → `UBCAB_BO_TOTP_SECRET`
+  missing; `totp=sent` with `invalid_grant` → wrong password or TOTP secret.
 
 ## Known gaps
 
