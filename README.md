@@ -34,10 +34,15 @@ same question can get different answers, exactly as in office.ubeats.mn.
   *browser* flow for the `ubeats-bo` client — GET the login page, POST the
   user's email + password to Keycloak's own form (with its cookies), capture
   the `302 https://office.ubeats.mn/?code=…`, and exchange the code with PKCE.
-  That flow doesn't ask for OTP, exactly like office.ubeats.mn. (The realm's
-  *direct grant* does ask OTP from anyone with an authenticator configured —
-  e.g. for the UBCab BO — which is why a plain password grant failed.)
-  The OTP field appears only if Keycloak's page actually asks for a code.
+  For users without OTP in that flow this logs in with just email + password,
+  exactly like office.ubeats.mn. (The realm's *direct grant* asks OTP from
+  anyone with an authenticator configured — e.g. for the UBCab BO — which is
+  why a plain password grant failed for them.)
+- **OTP**: the OTP field is optional. A typed code always goes to the direct
+  grant (password + `otp`), never to Keycloak's browser OTP form — codes are
+  single-use, and one spent on a browser step that then dead-ended made the
+  direct-grant fallback fail too (build `2026-10-18b`). If the browser flow
+  reaches an OTP step without a code, the page asks for one.
   If the browser flow can't be driven (theme change, redirect URI rejected…),
   the server falls back to the direct grant and the error shows
   `[тех.: <build>; browser flow: <reason>]`.

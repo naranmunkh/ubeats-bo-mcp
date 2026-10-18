@@ -149,7 +149,7 @@ class BOError extends Error {
  * live and what it sent — a stale deploy and a wrong env var look identical
  * otherwise. Bump it with every auth change.
  */
-const AUTH_BUILD = "2026-10-18b per-user-browser-login";
+const AUTH_BUILD = "2026-10-18c otp-via-direct-grant";
 
 interface RequestOptions {
   query?: Record<string, unknown>;
@@ -609,9 +609,12 @@ async function keycloakDirectGrantLogin(username: string, password: string, otp:
 //   POST /token grant_type=authorization_code + code_verifier
 //
 // redirect_uri is office.ubeats.mn — already registered for ubeats-bo — so no
-// Keycloak change is needed. If Keycloak does show an OTP step, the user's
-// code (if given) is submitted to it. Anything unexpected → "unsupported", and
-// the caller falls back to the direct grant.
+// Keycloak change is needed. If Keycloak shows an OTP step, the flow stops
+// with "otp_required" and the user's code goes to the direct grant instead —
+// never to this form: codes are single-use, and one spent on a browser step
+// that then dead-ends (seen in production, 2026-10-18) made the direct-grant
+// fallback fail too. Anything unexpected → "unsupported", and the caller
+// falls back to the direct grant.
 // ---------------------------------------------------------------------------
 
 type BrowserLogin =
@@ -708,7 +711,7 @@ class CookieJar {
   }
 }
 
-async function keycloakBrowserLogin(username: string, password: string, otp: string): Promise<BrowserLogin> {
+async function keycloakBrowserLogin(username: string, password: string): Promise<BrowserLogin> {
   const kc = kcConfig();
   const realmBase = `${kc.ssoUrl}/realms/${encodeURIComponent(kc.realm)}`;
   const redirectUri = `${kc.origin}/`;
@@ -776,7 +779,6 @@ async function keycloakBrowserLogin(username: string, password: string, otp: str
   if (/Invalid parameter:\s*redirect_uri/i.test(html)) return { kind: "unsupported", reason: "redirect_uri not allowed" };
 
   let code: string | null = null;
-  let otpSubmitted = false;
   let passwordSubmitted = false;
   for (let step = 0; step < 6 && !code; step++) {
     const forms = loginForms(html, res.url || authUrl.toString());
@@ -791,21 +793,17 @@ async function keycloakBrowserLogin(username: string, password: string, otp: str
       const userField = pwForm.names.has("username") ? "username" : pwForm.names.has("email") ? "email" : "username";
       res = await post(pwForm.action, { ...pwForm.fields, [userField]: username, password, credentialId: pwForm.fields.credentialId ?? "" });
     } else if (otpForm) {
-      if (!otp) {
-        return { kind: "otp_required", message: "Таны BO данс энэ удаа OTP код асууж байна — authenticator апп дээрх 6 оронтой кодоо оруулна уу." };
-      }
-      if (otpSubmitted) {
-        return { kind: "bad_credentials", message: kcErrorText(html) ?? "OTP код буруу байна. Шинэ кодоор дахин оролдоно уу." };
-      }
-      otpSubmitted = true;
-      const otpField = otpForm.names.has("otp") ? "otp" : "totp";
-      res = await post(otpForm.action, { ...otpForm.fields, [otpField]: otp });
+      // Password accepted; the code is for the direct grant (see above).
+      return { kind: "otp_required", message: "Таны BO данс OTP код асууж байна — authenticator апп дээрх 6 оронтой кодоо оруулна уу." };
     } else {
       // Required action (update password, configure OTP, terms…) or an unknown page.
       const msg = kcErrorText(html);
+      const title = /<title>([\s\S]*?)<\/title>/i.exec(html)?.[1]?.replace(/\s+/g, " ").trim();
       return {
         kind: "unsupported",
-        reason: msg ? `Keycloak page needs attention: ${msg}` : "unexpected Keycloak page",
+        reason: msg
+          ? `Keycloak page needs attention: ${msg}`
+          : `unexpected Keycloak page (HTTP ${res.status}${title ? `, "${htmlDecode(title)}"` : ""})`,
       };
     }
 
@@ -851,14 +849,16 @@ async function keycloakBrowserLogin(username: string, password: string, otp: str
 }
 
 /**
- * Log a connector user in with THEIR credentials. Tries the browser flow
- * first (what office.ubeats.mn does — no OTP for ubeats-bo), then the direct
- * grant as a fallback when the browser flow can't be driven.
+ * Log a connector user in with THEIR credentials. With an OTP typed, goes
+ * straight to the direct grant (the path that has always worked with OTP).
+ * Without one, tries the browser flow first (what office.ubeats.mn does),
+ * then the direct grant as a fallback when the browser flow can't be driven.
  */
 async function keycloakUserLogin(username: string, password: string, otp: string): Promise<UserLogin> {
+  if (otp) return keycloakDirectGrantLogin(username, password, otp);
   let browser: BrowserLogin;
   try {
-    browser = await keycloakBrowserLogin(username, password, otp);
+    browser = await keycloakBrowserLogin(username, password);
   } catch (err) {
     browser = { kind: "unsupported", reason: err instanceof Error ? err.message : String(err) };
   }
@@ -876,7 +876,7 @@ async function keycloakUserLogin(username: string, password: string, otp: string
   }
   console.error(`[ubeats-bo-mcp] browser-flow login unavailable (${browser.reason}); falling back to direct grant`);
   try {
-    return await keycloakDirectGrantLogin(username, password, otp);
+    return await keycloakDirectGrantLogin(username, password, "");
   } catch (err) {
     // Surface why the normal (browser) path was skipped — it's the only clue
     // available from the login page when Vercel logs aren't at hand. Non-secret.
@@ -1536,8 +1536,8 @@ button{margin-top:1.25rem;width:100%;padding:.65rem;border:0;border-radius:8px;b
 <input id="em" type="email" name="email" autocomplete="username" value="${escapeHtml(email)}" ${email ? "" : "autofocus"} required>
 <label for="pw">Нууц үг</label>
 <input id="pw" type="password" name="password" autocomplete="current-password" ${email && !opts.askOtp ? "autofocus" : ""} required>
-${opts.askOtp ? `<label for="otp">OTP код <span class="opt">— authenticator апп дээрх 6 орон</span></label>
-<input id="otp" type="text" name="otp" inputmode="numeric" pattern="[0-9]{6,8}" maxlength="8" autocomplete="one-time-code" autofocus required placeholder="123456">` : ""}
+<label for="otp">OTP код <span class="opt">${opts.askOtp ? "— authenticator апп дээрх 6 орон" : "(шаардлагатай бол)"}</span></label>
+<input id="otp" type="text" name="otp" inputmode="numeric" pattern="[0-9]{6,8}" maxlength="8" autocomplete="one-time-code" ${opts.askOtp ? "autofocus required" : ""} placeholder="123456">
 ${opts.error ? `<div class="err">${escapeHtml(opts.error)}</div>` : ""}
 <button type="submit">Нэвтрэх ба зөвшөөрөх</button></form>
 <p class="muted">Холболт таны эрхээр ажиллана — BO дээр танд харагддаг өгөгдөл л нээгдэнэ. Нууц үг хадгалагдахгүй; зөвхөн нэг удаа Keycloak руу дамжина.</p>
@@ -1655,8 +1655,8 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
       } catch (err) {
         const msg = err instanceof Error && err.message ? err.message : String(err);
         const b = err instanceof BOError ? (err.body as any) : null;
-        // Show the OTP field only when Keycloak actually asked for a code (or the
-        // user already typed one) — office.ubeats.mn itself doesn't use OTP.
+        // Highlight (and require) the OTP field when Keycloak asked for a code or
+        // the user already typed one.
         const askOtp = b?.kind === "otp_required" || (!!otp && b?.error === "invalid_grant") || (b?.flow !== "browser" && b?.error === "invalid_grant");
         sendHtml(res, 401, authorizePage(params, { error: msg, email, askOtp }));
         return;
